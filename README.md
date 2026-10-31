@@ -10,22 +10,27 @@ web page (no CDN, no build step) and drives OpenFOAM through the shell.
 
 - **Cases and folders**: create, open, rename, move (drag and drop) and delete cases in nested folders
   under `$FOAM_RUN`; a folder can hold a shared part for all its cases; "use case as template".
-- **Physics**: fluid library, speed and direction, angle of attack / yaw, fixed or moving wind-tunnel
-  ground, half models on a symmetry plane, Spalart–Allmaras, k-ω SST and γ-Reθ transition turbulence models,
-  steady (SIMPLE) or transient (PIMPLE, Courant-limited time step, optional warm start).
+- **Physics**: fluid library, International Standard Atmosphere at any altitude, speed and direction,
+  angle of attack / yaw, fixed or moving wind-tunnel ground, half models on a symmetry plane,
+  Spalart–Allmaras, k-ω SST and γ-Reθ transition turbulence models (several can be solved side by side on
+  the same mesh), steady (SIMPLE) or transient (PIMPLE, Courant-limited time step, optional warm start).
 - **Meshing**: blockMesh + snappyHexMesh with presets or explicit cell sizes, boundary layers sized by
   relative thickness or a y+ target (with a first-layer calculator), a wake refinement box, a configurable
-  domain, a checkMesh quality report and automatic retry at a finer level when the mesh fails.
+  domain, a memory estimate, a checkMesh quality report, automatic retry at a finer level when the mesh
+  fails, and automatic removal of disconnected mesh regions trapped in gaps of the part.
 - **Running**: parallel (MPI) meshing and solving, a FIFO job queue, auto-stop on convergence, progress
-  with ETA, graceful stop that still writes the fields.
+  with ETA, graceful stop that still writes the fields; on WSL, the memory and swap limits can be set
+  from the UI.
 - **Results**: Cd/Cl/Cm and forces/moments averaged over the last N iterations (time-weighted for
   transient runs, with a Strouhal number), convergence and residual plots, inlet/outlet monitors, point
-  probes and sample lines, comparing two cases, CSV export and a printable HTML report, preset ParaView views.
-- **Studies**: parameter sweeps (speed, angles, mesh resolution), mesh-independence studies, aircraft
-  polars (CLα, CLmax, best L/D, Oswald e), neutral point / static margin, flight speeds from the mass,
-  yaw-stability derivatives.
-- **UI**: Basic / Intermediate / Advanced modes, hover help on every control, 3-D part and domain
-  previews, unsaved settings kept per case in the browser.
+  probes and sample lines, comparing two cases, CSV export and a printable HTML report, preset ParaView
+  views: slices, surface pressure, wake, pathlines from an adjustable seed rake (also near-part and
+  in-section pathlines), Q-criterion vortices and oil-flow (skin-friction) lines.
+- **Studies**: parameter sweeps (speed, angles, altitude, mesh resolution), mesh-independence studies,
+  aircraft polars (CLα, CLmax, best L/D, Oswald e), neutral point / static margin, flight speeds from the
+  mass (including the level-flight speed from a speed sweep), yaw-stability derivatives.
+- **UI**: Basic / Intermediate / Advanced modes, hover help on every control, mm or m length units,
+  3-D part and domain previews, unsaved settings kept per case in the browser.
 
 ## Requirements
 

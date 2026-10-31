@@ -33,6 +33,7 @@ runs, a FIFO job queue, parallel (MPI) meshing/solving, a fluid material
 library, boundary layers + wake refinement, inlet/outlet monitors, a residual
 plot, preset ParaView views, Basic/Advanced modes and "use case as template".
 """
+import base64
 import csv
 import glob
 import html
@@ -108,16 +109,232 @@ THREADS = os.cpu_count() or 1
 CORES = physical_cores()
 DEFAULT_NPROCS = CORES
 
-# fluid presets at 20 C, 1 atm: key -> (label, kinematic viscosity nu [m2/s], density rho [kg/m3])
+# rough meshing memory, for the preview's warning: snappyHexMesh peaks at about 2 GB per million cells (layer
+# addition), plus each MPI rank's own overhead (libraries, its piece of the decomposed mesh's bookkeeping)
+MESH_BYTES_PER_CELL = 2000
+RANK_BYTES = 200e6
+
+
+def meminfo():
+    """/proc/meminfo as {key: bytes} (empty when unreadable)."""
+    out = {}
+    try:
+        for line in open("/proc/meminfo"):
+            k, _, v = line.partition(":")
+            if v.split():
+                out[k] = int(v.split()[0]) * 1024
+    except (OSError, ValueError):
+        pass
+    return out
+
+
+def available_ram():
+    """Memory the kernel could give new processes right now (MemAvailable in /proc/meminfo), bytes; None
+    when unknown. Under WSL that's the VM's share of Windows' RAM (memory= in .wslconfig)."""
+    return meminfo().get("MemAvailable")
+
+
+# WSL's memory and swap: memory= / swap= in the [wsl2] section of %UserProfile%\.wslconfig (defaults: half the
+# RAM, a quarter of it), read when WSL starts - so the Mesh card's Apply rewrites them and restarts WSL
+WIN_CMD = shutil.which("cmd.exe") or "/mnt/c/Windows/System32/cmd.exe"
+WIN_PS = shutil.which("powershell.exe") or "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+WIN_CWD = "/mnt/c" if os.path.isdir("/mnt/c") else None   # cmd.exe warns about a Linux working directory
+WSL_INFO = {}
+GIB = 2 ** 30   # .wslconfig's GB
+
+
+def windows_cmd(argv, timeout=20):
+    """stdout of a program run through WSL's Windows interop, '' when it fails."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=WIN_CWD)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def wsl_info():
+    """Under WSL: {distro, config: the .wslconfig path, win_total: Windows' RAM in bytes or None}; None
+    elsewhere. Asked of Windows once per server process (each interop call takes a second or so)."""
+    distro = os.environ.get("WSL_DISTRO_NAME")
+    if distro and not WSL_INFO:
+        home = windows_cmd([WIN_CMD, "/c", "echo %USERPROFILE%"])
+        home = home and windows_cmd(["wslpath", "-u", home])
+        if home:
+            ram = windows_cmd([WIN_PS, "-NoProfile", "-Command",
+                               "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"])
+            WSL_INFO.update(distro=distro, config=os.path.join(home, ".wslconfig"),
+                            win_total=int(ram) if ram.isdigit() else None)
+    return WSL_INFO or None
+
+
+def wslconfig_lines(path):
+    """.wslconfig's lines ([] when missing); PowerShell's Out-File writes it as UTF-16."""
+    try:
+        raw = open(path, "rb").read()
+    except OSError:
+        return []
+    return raw.decode("utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig", "replace").splitlines()
+
+
+def wsl2_scan(lines, keys=("memory", "swap")):
+    """(index of the [wsl2] header or None, {line index: (key, value)} for those keys in that section)."""
+    head, at, section = None, {}, None
+    for i, line in enumerate(lines):
+        s = line.strip()
+        m = re.fullmatch(r"\[([^\]]*)\]", s)
+        kv = re.match(r"(\w+)\s*=\s*([^#]*)", s)
+        if m:
+            section = m[1].strip().lower()
+            if section == "wsl2" and head is None:
+                head = i
+        elif section == "wsl2" and kv and kv[1].lower() in keys:
+            at[i] = (kv[1].lower(), kv[2].strip())
+    return head, at
+
+
+def wsl_size_gb(text):
+    """A .wslconfig size ('12GB', '8192MB', '0'; a plain number is bytes) in GB, None if unreadable."""
+    m = re.fullmatch(r"\s*([\d.]+)\s*([KMGT]?)B?\s*", text or "", re.I)
+    try:
+        return float(m[1]) * {"": 1, "K": 2 ** 10, "M": 2 ** 20, "G": GIB, "T": 2 ** 40}[m[2].upper()] / GIB
+    except (TypeError, ValueError):
+        return None
+
+
+def read_wslconfig(path):
+    """{memory, swap} in GB as .wslconfig sets them (None: not set, WSL's default)."""
+    _, at = wsl2_scan(wslconfig_lines(path))
+    out = {"memory": None, "swap": None}
+    out.update({k: wsl_size_gb(v) for k, v in at.values()})
+    return out
+
+
+def write_wslconfig(path, values):
+    """Set .wslconfig's [wsl2] keys to values {key: text, or None to remove it}, leaving every other line
+    (other keys, sections, comments) as it is; adds the section when missing."""
+    lines = wslconfig_lines(path)
+    head, at = wsl2_scan(lines, tuple(values))
+    if head is None:
+        lines += ([""] if lines and lines[-1].strip() else []) + ["[wsl2]"]
+        head = len(lines) - 1
+    first = {}
+    for i, (k, _) in sorted(at.items(), reverse=True):
+        first[k] = i
+    out = []
+    for i, line in enumerate(lines):
+        if i not in at:
+            out.append(line)
+        elif first[at[i][0]] == i and values[at[i][0]] is not None:   # duplicates of a key are dropped
+            out.append(f"{at[i][0]}={values[at[i][0]]}")
+        if i == head:
+            out += [f"{k}={v}" for k, v in values.items() if v is not None and k not in first]
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(out) + "\n")
+
+
+def wsl_memory():
+    """The Mesh card's WSL memory block: the .wslconfig settings, what WSL has now and Windows' RAM (bytes)."""
+    info = wsl_info()
+    if not info:
+        return {"wsl": False}
+    m = meminfo()
+    return {"wsl": True, "path": info["config"], **read_wslconfig(info["config"]),
+            "mem_total": m.get("MemTotal"), "swap_total": m.get("SwapTotal"), "win_total": info["win_total"]}
+
+
+def set_wsl_memory(memory, swap):
+    """Validate the form's WSL memory and swap (GB; blank = WSL's default) and write them to .wslconfig."""
+    info = wsl_info()
+    if not info:
+        raise ValueError("PIFOAM isn't running under WSL, so there's no WSL memory to set.")
+    win = info["win_total"] / GIB if info["win_total"] else 1024
+    values = {}
+    for key, v, lo, hi, msg in (
+            ("memory", memory, 1, win, f"WSL memory must be between 1 and {win:.3g} GB (this PC's RAM), or blank "
+                                      "for WSL's default (half of it)."),
+            ("swap", swap, 0, 256, "Swap must be between 0 (off) and 256 GB, or blank for WSL's default "
+                                   "(a quarter of WSL's memory).")):
+        v = str(v if v is not None else "").strip()
+        if not v:
+            values[key] = None
+            continue
+        try:
+            gb = float(v)
+        except ValueError:
+            raise ValueError(msg)
+        if not lo <= gb <= hi:
+            raise ValueError(msg)
+        values[key] = f"{int(gb)}GB" if gb == int(gb) else f"{round(gb * 1024)}MB"
+    write_wslconfig(info["config"], values)
+    log(f"\n[wsl] {info['config']}: " + ", ".join(f"{k}={v or 'default'}" for k, v in values.items()) + "\n")
+
+# fluid presets at 20 C, 1 atm: key -> (label, kinematic viscosity nu [m2/s], density rho [kg/m3], gas), gas =
+# (molar mass kg/mol, dynamic viscosity Pa s at 273.15 K, Sutherland constant K, heat capacity ratio) for the
+# standard atmosphere (gas_state; air: the ISA's own constants, the others White's Sutherland data), None for a liquid
 MATERIALS = {
-    "air": ("Air", 1.5e-5, 1.204),
-    "water": ("Water", 1.004e-6, 998.2),
-    "seawater": ("Seawater (3.5% saline)", 1.05e-6, 1025.0),
-    "co2": ("Carbon dioxide", 8.03e-6, 1.842),
-    "argon": ("Argon", 1.34e-5, 1.661),
-    "hydrogen": ("Hydrogen", 1.05e-4, 0.0838),
-    "nitrogen": ("Nitrogen", 1.5e-5, 1.165),
+    "air": ("Air", 1.5e-5, 1.204, (0.0289644, 1.716e-5, 110.4, 1.4)),
+    "water": ("Water", 1.004e-6, 998.2, None),
+    "seawater": ("Seawater (3.5% saline)", 1.05e-6, 1025.0, None),
+    "co2": ("Carbon dioxide", 8.03e-6, 1.842, (0.04401, 1.370e-5, 222, 1.289)),
+    "argon": ("Argon", 1.34e-5, 1.661, (0.039948, 2.125e-5, 144, 1.667)),
+    "hydrogen": ("Hydrogen", 1.05e-4, 0.0838, (0.002016, 8.411e-6, 97, 1.405)),
+    "nitrogen": ("Nitrogen", 1.5e-5, 1.165, (0.0280134, 1.663e-5, 107, 1.4)),
 }
+
+# International Standard Atmosphere (1976): layer bases (geopotential m) and lapse rates (K/m) up to its top;
+# sea level 288.15 K, 101325 Pa
+ISA_LAYERS = ((0, -0.0065), (11000, 0.0), (20000, 0.001), (32000, 0.0028), (47000, 0.0), (51000, -0.0028),
+              (71000, -0.002), (84852, None))
+ISA_RANGE = (-5000, 86000)   # geometric altitudes (m) it covers
+R_GAS = 8.31432              # J/(mol K), the value the standard atmosphere is defined with
+R_EARTH = 6356766            # m, for the geopotential altitude
+
+
+def isa(h):
+    """Temperature (K) and pressure (Pa) of the International Standard Atmosphere at geometric altitude h (m)."""
+    if not ISA_RANGE[0] <= h <= ISA_RANGE[1]:
+        raise ValueError(f"Altitude must be between {ISA_RANGE[0]} and {ISA_RANGE[1]} m (the standard atmosphere).")
+    H = R_EARTH * h / (R_EARTH + h)   # the layers are defined in geopotential altitude
+    T, p, r = 288.15, 101325.0, R_GAS / MATERIALS["air"][3][0]
+    for (h0, a), (h1, _) in zip(ISA_LAYERS, ISA_LAYERS[1:]):
+        dh = min(H, h1) - h0   # below sea level: the first layer extended down
+        if a:
+            T1 = T + a * dh
+            p *= (T1 / T) ** (-G / (r * a))
+            T = T1
+        else:
+            p *= math.exp(-G * dh / (r * T))
+        if H <= h1:
+            break
+    return T, p
+
+
+def fluid_gas(p):
+    """The gas data of the form's fluid preset (MATERIALS), None for a liquid or a custom fluid."""
+    return (MATERIALS.get(p.get("fluid")) or (None,) * 4)[3]
+
+
+def gas_state(p):
+    """A gas preset in the standard atmosphere ('atmosphere' isa at 'altitude' m): {T, p, rho, nu, a} from the
+    ideal-gas law rho = p M / (R T), Sutherland's viscosity law and the speed of sound sqrt(gamma p / rho).
+    None for 'lab' (the presets' 20 C, 1 atm), a liquid or a custom fluid: the form's rho and nu hold."""
+    atm = p.get("atmosphere") or "lab"
+    if atm not in ("lab", "isa"):
+        raise ValueError("Atmosphere must be 'lab' or 'isa'.")
+    gas = fluid_gas(p)
+    if atm == "lab" or not gas:
+        return None
+    T, pa = isa(opt_float(p, "altitude", 0))
+    M, mu0, S, gamma = gas
+    rho = pa * M / (R_GAS * T)
+    mu = mu0 * (T / 273.15) ** 1.5 * (273.15 + S) / (T + S)
+    return {"T": T, "p": pa, "rho": rho, "nu": mu / rho, "a": math.sqrt(gamma * pa / rho)}
+
+
+def apply_atmosphere(p):
+    """p with the density and viscosity of its gas in the standard atmosphere (gas_state), else unchanged."""
+    s = gas_state(p)
+    return dict(p, rho=s["rho"], nu=s["nu"]) if s else p
 
 # simulation types a new case can be created as (key -> label); stored in gui.json params["sim_type"]
 SIM_TYPES = {"external": "External flow (steady)", "transient": "External flow (transient)"}   # incompressible
@@ -143,7 +360,13 @@ def _preset(v):
     return v
 
 
-SWEEP_PARAMS = {"speed": float, "dir": str, "aoa": float, "yaw": float,
+def _altitude(v):
+    h = float(v)
+    isa(h)   # within the standard atmosphere
+    return h
+
+
+SWEEP_PARAMS = {"speed": float, "dir": str, "aoa": float, "yaw": float, "altitude": _altitude,
                 "mesh_preset": _preset, "cell_size_mm": float, "target_cells": float, "surface_cell_mm": float}
 GROUND_TYPES = ("none", "fixed", "moving")
 # half model: off; the full part cut by a symmetry plane across the span axis at its bbox centre or at
@@ -153,6 +376,8 @@ HALF_INSET = 1e-3       # an already-half part's symmetry plane sits this fracti
 # RAS models (key -> label); the key is written to constant/momentumTransport
 TURB_MODELS = {"SpalartAllmaras": "Spalart–Allmaras", "kOmegaSST": "k-ω SST",
                "kOmegaSSTLM": "k-ω SST with γ-Reθ transition"}
+# short names, in the case names of a case's extra models (extra_models): <case>_models/<case>_SST
+TURB_SHORT = {"SpalartAllmaras": "SA", "kOmegaSST": "SST", "kOmegaSSTLM": "SSTLM"}
 MAX_ANGLE = 30          # |angle of attack| and |yaw| limit (deg); larger tilts leave the axis-aligned domain
 # features a case can switch off (key -> (label, the params they reset to neutral)); a case's 'features' param
 # lists the disabled keys (missing = all on). Injected into PAGE via /*FEATURE_GROUPS*/null; apply_features enforces
@@ -166,7 +391,8 @@ FEATURE_GROUPS = {
     "compare": ("Compare cases", {}),
 }
 AVG_WINDOW = 100        # default number of final iterations coefficients are averaged over
-G = 9.81                # gravity (m/s2), for flight figures from the aircraft mass
+G = 9.80665             # standard gravity (m/s2), for flight figures from the aircraft mass
+LEVEL_SPEED_TOL = 0.05  # a level-flight speed this close to the simulated one shares its Reynolds number (and Cl)
 
 
 def log(text):
@@ -300,8 +526,8 @@ geometry
 }
 castellatedMeshControls
 {
-    maxLocalCells $maxcells;
-    maxGlobalCells $maxcells;
+    maxLocalCells 5000000;
+    maxGlobalCells 1000000000;   // no cap: the preview warns when the estimated mesh won't fit in RAM
     minRefinementCells 0;
     nCellsBetweenLevels $nbetween;
     features ( { file "part.eMesh"; level $level; } );
@@ -455,7 +681,9 @@ DECOMPOSE = FOAMFILE % ("dictionary", "decomposeParDict") + \
     "numberOfSubdomains %d;\ndecomposer      scotch;\ndistributor     ptscotch;\n"
 
 # Predefined ParaView views (value -> button label/description is the PAGE's JS 'PV' list)
-PV_VIEWS = ("overview", "uslice", "pslice", "streamlines", "bodyp", "wake")
+PV_VIEWS = ("overview", "uslice", "pslice", "rake", "near", "section", "vortex", "oilflow", "bodyp", "wake")
+# views that need a field the solver doesn't write -> the OpenFOAM function object that computes it on open
+PV_FIELDS = {"vortex": "Q", "oilflow": "wallShearStress"}
 
 # pvpython script for the ParaView button (run from the case dir), prefixed by
 # the server with a 'CFG = {...}' line: the chosen view plus compute_geometry()
@@ -505,10 +733,22 @@ def reader(want_body):
     return r
 
 view = GetActiveViewOrCreate('RenderView')
-try:
-    view.UseFXAA = 1   # anti-aliasing: smooths jagged slice and part edges
-except AttributeError:
-    pass
+INK = [0.15, 0.15, 0.17]   # text and outlines on the light background
+PAPER = [0.96, 0.96, 0.94]   # light lines over dark colours
+
+def light_scene():
+    # a white-to-light-grey gradient instead of ParaView's dark palette, so coloured lines and the grey part stand
+    # out; property names differ between ParaView 5.10 and 5.11+
+    for k, v in (('UseFXAA', 1),   # anti-aliasing: smooths jagged slice, tube and part edges
+                 ('UseColorPaletteForBackground', 0), ('BackgroundColorMode', 'Gradient'),
+                 ('UseGradientBackground', 1), ('Background', [0.80, 0.82, 0.85]), ('Background2', [1.0, 1.0, 1.0]),
+                 ('OrientationAxesLabelColor', INK)):
+        try:
+            setattr(view, k, v)
+        except Exception:   # AttributeError, or NotSupportedException for a name the other version renamed
+            pass
+
+light_scene()
 internal, body = reader(False), reader(True)
 
 def reflect(src):
@@ -556,6 +796,7 @@ def color(disp, field, title, presets, comp=None, fmt='%-#.2f'):
     for k, v in (('Title', title), ('ComponentTitle', ''), ('TitleFontSize', 16), ('LabelFontSize', 13),
                  ('AutomaticLabelFormat', 0), ('LabelFormat', fmt), ('AddRangeLabels', 0),
                  ('ScalarBarLength', 0.45), ('ScalarBarThickness', 14),
+                 ('TitleColor', INK), ('LabelColor', INK), ('HorizontalTitle', 1),
                  ('WindowLocation', 'Lower Right Corner')):
         try:
             setattr(bar, k, v)
@@ -576,13 +817,22 @@ def velocity(disp):
     color(disp, 'U', 'Velocity magnitude (m/s)', ('Turbo', 'Jet'), 'Magnitude', '%-#.1f')
 
 def grey(disp):
-    # solid colour without ColorBy(disp, None), which raises "invalid association string" on empty data
+    # solid colour without ColorBy(disp, None), which raises "invalid association string" on empty data;
+    # a little specular so the part reads as a shaded solid
     disp.ColorArrayName = ['POINTS', '']
     disp.DiffuseColor = [0.75, 0.75, 0.78]
     disp.AmbientColor = [0.75, 0.75, 0.78]
+    disp.Specular = 0.3
+
+def outline(src):
+    # the domain's outline, dark on the light background
+    d = Show(src, view)
+    d.SetRepresentationType('Outline')
+    ink(d)
 
 def frame():
-    # the box the camera frames: the part and its near wake, not the whole (much larger) domain
+    # the box the camera frames: the part and its near wake, not the whole (much larger) domain, plus the
+    # pathline rake's corners when there is one
     ctr, L, ax, sgn = CFG['ctr'], max(CFG['ext']), CFG['axis'], CFG['sign']
     lo, hi = [], []
     for k in range(3):
@@ -592,12 +842,24 @@ def frame():
             a, b = (a, ctr[k] + 2 * L) if sgn > 0 else (ctr[k] - 2 * L, b)
         lo.append(a)
         hi.append(b)
-    return lo, hi
+    for q in CFG.get('rake_box', []):
+        for k in range(3):
+            lo[k], hi[k] = min(lo[k], q[k]), max(hi[k], q[k])
+    # nothing is drawn outside the domain: don't frame empty space past a close outlet or side
+    return [max(lo[k], CFG['lo'][k]) for k in range(3)], [min(hi[k], CFG['hi'][k]) for k in range(3)]
 
-def camera(direction, up):
-    # placed by hand; render first, since paraview.simple resets the camera on a view's first Render()
+def around(src, grow):
+    # the box framing src's bounds, each side grown by `grow` x its largest size (the surface views and a section)
+    src.UpdatePipeline(scene.AnimationTime)
+    b = src.GetDataInformation().GetBounds()
+    r = grow * max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
+    return [b[2 * k] - r for k in range(3)], [b[2 * k + 1] + r for k in range(3)]
+
+def camera(direction, up, box=None):
+    # placed by hand, framing `box` ((lo, hi); default frame()); render first, since paraview.simple resets the
+    # camera on a view's first Render()
     Render(view)
-    lo, hi = frame()
+    lo, hi = box or frame()
     focus = [(lo[k] + hi[k]) / 2 for k in range(3)]
     radius = 0.5 * sum((hi[k] - lo[k]) ** 2 for k in range(3)) ** 0.5
     n = sum(d * d for d in direction) ** 0.5
@@ -606,27 +868,18 @@ def camera(direction, up):
     view.CameraPosition = [focus[k] + dist * direction[k] / n for k in range(3)]
     view.CameraViewUp = up
 
-def fine_slice(src, normal_axis, px=4000):
-    # a plane through the part centre, sampled on a regular grid (px points across the framed region,
-    # plus a margin, within the domain) instead of cut through the mesh: every point is interpolated
-    # inside its cell, so coarse cells and refinement-level steps don't show as facets
-    lo, hi = frame()
-    side = max(hi[k] - lo[k] for k in range(3) if k != normal_axis)
-    origin = list(CFG['ctr'])
+def plane_at(normal_axis, at=None):
+    # a cut plane's coordinate: the part centre's, or `at`, just off a half model's symmetry plane, where the halves meet
+    at = CFG['ctr'][normal_axis] if at is None else at
     sym = CFG.get('sym')
-    if sym and sym[0] == normal_axis and abs(origin[normal_axis] - sym[1]) < 1e-4 * max(CFG['ext']):
-        origin[normal_axis] += 1e-3 * max(CFG['ext'])   # just off the symmetry plane, where the halves meet
-    bounds, dims = [], []
-    for k in range(3):
-        if k == normal_axis:
-            bounds += [origin[k]] * 2
-            dims.append(1)
-            continue
-        m = 0.25 * (hi[k] - lo[k])
-        a, b = max(lo[k] - m, CFG['lo'][k]), min(hi[k] + m, CFG['hi'][k])
-        bounds += [a, b]
-        dims.append(max(2, int(px * (b - a) / side)))
-    # cut the plane first and sample that: probing a few thousand polygons, not the whole volume mesh
+    if sym and sym[0] == normal_axis and abs(at - sym[1]) < 1e-4 * max(CFG['ext']):
+        at += 1e-3 * max(CFG['ext'])
+    return at
+
+def slice_plane(src, normal_axis, at=None):
+    # a plain cut through the part centre, or at `at` on normal_axis
+    origin = list(CFG['ctr'])
+    origin[normal_axis] = plane_at(normal_axis, at)
     s = Slice(Input=src)
     s.SliceType = 'Plane'
     try:
@@ -635,28 +888,116 @@ def fine_slice(src, normal_axis, px=4000):
         pass
     s.SliceType.Origin = origin
     s.SliceType.Normal = unit(normal_axis)
-    # the cut points are stored in single precision, ~1e-10 m off the plane, and ResampleToImage then finds no
-    # polygon at any sample (only a plane lying on mesh faces is exact): snap them onto the plane
-    snap = Calculator(Input=s)
-    snap.CoordinateResults = 1
-    snap.Function = '+'.join(repr(origin[k]) + '*' + h if k == normal_axis else 'coords' + 'XYZ'[k] + '*' + h
-                             for k, h in enumerate(('iHat', 'jHat', 'kHat')))
-    r = ResampleToImage(Input=snap)
-    r.UseInputBounds = 0
-    r.SamplingBounds = bounds
-    r.SamplingDimensions = dims
-    t = Threshold(Input=r)   # drop the samples inside the part (outside the mesh)
-    t.Scalars = ['POINTS', 'vtkValidPointMask']
-    try:
-        t.LowerThreshold, t.UpperThreshold = 0.5, 1.5
-    except AttributeError:
-        t.ThresholdRange = [0.5, 1.5]   # ParaView < 5.10
+    return s
+
+def points(pts):
+    return PolyPointSource(Points=[c for q in pts for c in q])
+
+def surface(src):
+    # a reader's region as one polygonal surface
+    return ExtractSurface(Input=MergeBlocks(Input=src))
+
+def tracer(src, seeds, vectors='U', direction='FORWARD', length=None, on_surface=False):
+    # lines along `vectors` from `seeds`, updated at the shown time; by default room for a line from the inlet to
+    # the outlet that bends around the part
+    t = StreamTracerWithCustomSource(Input=src, SeedSource=seeds)
+    t.Vectors = ['POINTS', vectors]
+    t.IntegrationDirection = direction
+    t.MaximumStreamlineLength = length or 2 * max(CFG['hi'][k] - CFG['lo'][k] for k in range(3))
+    if on_surface:
+        t.SurfaceStreamlines = 1   # stay on the input surface: the flow along a plane or a wall
+    t.UpdatePipeline(scene.AnimationTime)
     return t
+
+def empty(src):
+    src.UpdatePipeline(scene.AnimationTime)   # a new filter's data information is empty until it runs
+    return src.GetDataInformation().GetNumberOfPoints() == 0
+
+def tubes(src, radius):
+    try:
+        t = Tube(Input=src)
+        t.Radius = radius
+        t.NumberofSides = 12
+        return t
+    except Exception:
+        return src
+
+def ink(disp, col=INK):
+    # uncoloured lines (dark by default) over a coloured plane or surface
+    disp.ColorArrayName = ['POINTS', '']
+    disp.AmbientColor = col
+    disp.DiffuseColor = col
+
+def trace(seeds, iso):
+    # pathlines through the internal field from `seeds`, traced downstream only (a rake upstream of the part:
+    # tracing back would just run to the inlet), as thin |U|-coloured tubes with the part
+    lines = tracer(internal, seeds)
+    if empty(lines):
+        # nothing traced (no flow field at this time, or every seed outside the fluid): show why, don't try to
+        # colour an empty result ("could not determine array range")
+        print('PIFOAM: no pathlines could be traced - solve the case first, or move the seeds into the flow.')
+        outline(internal)
+    else:
+        # a fraction of the seed spacing: lines never merge
+        velocity(Show(tubes(lines, CFG.get('tube', 0.004 * max(CFG['ext']))), view))
+    grey(Show(body, view))
+    camera(iso, unit(CFG['lift_axis']))
+
+def part_surface():
+    # the part's triangulated surface as vtk data here in the script, for distances to it (servermanager.Fetch +
+    # vtk filters: no ProgrammableFilter, which breaks this builtin session)
+    return servermanager.Fetch(Triangulate(Input=surface(body)))
+
+def away_from_part(src, d):
+    # src's surfaces without the pieces closer than d to the part, as a new pipeline source
+    from vtkmodules.vtkFiltersCore import vtkThreshold
+    from vtkmodules.vtkFiltersGeneral import vtkDistancePolyDataFilter
+    from vtkmodules.vtkFiltersGeometry import vtkGeometryFilter
+    dist = vtkDistancePolyDataFilter()
+    dist.SetInputData(0, servermanager.Fetch(surface(src)))
+    dist.SetInputData(1, part_surface())
+    dist.SignedDistanceOff()
+    dist.ComputeSecondDistanceOff()
+    th = vtkThreshold()
+    th.SetInputConnection(dist.GetOutputPort())
+    th.SetInputArrayToProcess(0, 0, 0, 0, 'Distance')   # point data
+    try:
+        th.SetThresholdFunction(vtkThreshold.THRESHOLD_UPPER)
+        th.SetUpperThreshold(d)
+    except AttributeError:
+        th.ThresholdByUpper(d)   # VTK < 9.1
+    geo = vtkGeometryFilter()
+    geo.SetInputConnection(th.GetOutputPort())
+    geo.Update()
+    out = TrivialProducer()
+    out.GetClientSideObject().SetOutput(geo.GetOutput())
+    return out
+
+def near_seeds(seeds, dmax):
+    # the seeds whose downstream pathline passes within dmax of the part: trace them all, then measure each line's
+    # closest approach to the part's surface here in the script
+    from vtkmodules.vtkCommonCore import vtkIdList
+    from vtkmodules.vtkFiltersCore import vtkImplicitPolyDataDistance
+    lines = tracer(internal, points(seeds))
+    if empty(lines):
+        return []
+    dist = vtkImplicitPolyDataDistance()
+    dist.SetInput(part_surface())
+    data = servermanager.Fetch(lines)
+    ids, pts, cell = data.GetCellData().GetArray('SeedIds'), data.GetPoints(), vtkIdList()
+    keep = []
+    for c in range(data.GetNumberOfCells()):
+        data.GetCellPoints(c, cell)
+        if any(abs(dist.EvaluateFunction(pts.GetPoint(cell.GetId(i)))) < dmax
+               for i in range(0, cell.GetNumberOfIds(), 2)):
+            keep.append(seeds[int(ids.GetTuple1(c))])
+    Delete(lines)
+    return keep
 
 body_p, color_body_p = pressure(body)
 
 if V == 'overview':
-    Show(internal, view).SetRepresentationType('Outline')
+    outline(internal)
     color_body_p(Show(body_p, view))
     view.ResetCamera()
 else:
@@ -667,94 +1008,97 @@ else:
     iso = [unit(pitch)[k] + 0.6 * unit(lift)[k] - 0.8 * sgn * unit(ax)[k] for k in range(3)]
     if V in ('uslice', 'pslice'):
         src, color_p = pressure(internal) if V == 'pslice' else (internal, None)
-        s = fine_slice(src, pitch)   # plane contains the flow and lift directions
+        s = slice_plane(src, pitch)   # plane contains the flow and lift directions
         if V == 'uslice':
             velocity(Show(s, view))
         else:
             color_p(Show(s, view))
         grey(Show(body, view))
         camera(unit(pitch), unit(lift))
-    elif V == 'streamlines':
+    elif V == 'rake':
+        # an even grid of seeds on a rectangle across the inflow just upstream of the part (seed_rake()); a half
+        # model's internal mesh is already reflected, so seeds on either side of the symmetry plane lie in it
+        trace(points(CFG['seeds']), iso)
+    elif V == 'near':
+        # the same rake, but only the pathlines that come within CFG['near'] of the part: the free stream that
+        # passes it by is left out
+        keep = near_seeds(CFG['seeds'], CFG['near'])
+        if not keep:
+            print('PIFOAM: no pathline passes within %.4g m of the part - showing all of them; '
+                  'raise the maximum distance or move the rake.' % CFG['near'])
+        trace(points(keep or CFG['seeds']), iso)
+    elif V == 'section':
+        # one plane across the span coloured by |U|, with the flow's in-plane part traced from a seed line upstream,
+        # and the part cut away on the camera's side. U without its span component, traced through the volume from
+        # seeds on the plane, never leaves the plane (surface streamlines on a slice stop at its many small cells)
+        k = CFG['plane'][0]
+        at = plane_at(k, CFG['plane'][1])
+        velocity(Show(slice_plane(internal, k, at), view))
+        flat = Calculator(Input=internal)
+        flat.ResultArrayName = 'Uplane'
+        flat.Function = '+'.join('U_%s*%sHat' % ('XYZ'[i], 'ijk'[i]) for i in range(3) if i != k)
+        seeds = [[at if i == k else q[i] for i in range(3)] for q in CFG['seeds']]   # onto the (nudged) plane
+        lines = tracer(flat, points(seeds), 'Uplane')
+        if empty(lines):
+            print('PIFOAM: no section lines could be traced - solve the case first, or move the section into the flow.')
+        else:
+            ink(Show(tubes(lines, CFG['tube']), view))
+        cut = Clip(Input=body)
+        cut.ClipType = 'Plane'
+        cut.ClipType.Origin = [at if i == k else CFG['ctr'][i] for i in range(3)]
+        cut.ClipType.Normal = unit(k)   # kept: the side away from the camera, which looks from +k
         try:
-            st = StreamTracer(Input=internal, SeedType='Point Cloud')
-        except Exception:
-            st = StreamTracer(Input=internal, SeedType='Point Source')
-        st.Vectors = ['POINTS', 'U']
-        lo, hi = CFG['lo'], CFG['hi']
-        size = [hi[k] - lo[k] for k in range(3)]
-        seed = list(ctr)
-        seed[ax] -= sgn * (0.5 * ext[ax] + 0.3 * L)   # just upstream of the part...
-        # ...but inside the domain (a short upstream margin would put every seed outside the mesh)
-        seed = [min(max(seed[k], lo[k] + 0.02 * size[k]), hi[k] - 0.02 * size[k]) for k in range(3)]
-        st.SeedType.Center = seed
-        st.SeedType.Radius = min(0.6 * max(ext[k] for k in range(3) if k != ax),
-                                 0.45 * min(size[k] for k in range(3) if k != ax))
-        st.SeedType.NumberOfPoints = 150
-        st.MaximumStreamlineLength = size[ax]
-        st.UpdatePipeline(scene.AnimationTime)
-        lines = st
-        traced = st.GetDataInformation().GetNumberOfPoints() > 0
-        if traced and CFG.get('near'):
-            # keep only the pathlines that come within CFG['near'] (m) of the part's surface. Plain VTK on
-            # the fetched lines, not a ProgrammableFilter: in this builtin session that leaks numpy's
-            # sum/min/max into the script's globals
-            from vtkmodules.all import (vtkSTLReader, vtkImplicitPolyDataDistance, vtkIdList,
-                                        vtkExtractCells, vtkGeometryFilter)
-            stl = vtkSTLReader()
-            stl.SetFileName('constant/geometry/part.stl')
-            stl.Update()
-            dist = vtkImplicitPolyDataDistance()
-            dist.SetInput(stl.GetOutput())
-            data = servermanager.Fetch(st)
-            # a pathline is traced as two cells (forward and backward from its seed): keep both if either
-            # comes near, so whole lines are shown
-            seeds = data.GetCellData().GetArray('SeedIds')
-            seed = (lambda c: seeds.GetValue(c)) if seeds else (lambda c: c)
-            def gap(pt):
-                # a half model's part.stl may be only the meshed half: measure the mirror side by its reflection
-                d = abs(dist.EvaluateFunction(pt))
-                if CFG.get('sym'):
-                    q = list(pt)
-                    q[CFG['sym'][0]] = 2 * CFG['sym'][1] - q[CFG['sym'][0]]
-                    d = min(d, abs(dist.EvaluateFunction(q)))
-                return d
-            near = set()
-            for c in range(data.GetNumberOfCells()):
-                ids = data.GetCell(c).GetPointIds()
-                if any(gap(data.GetPoint(ids.GetId(i))) <= CFG['near'] for i in range(ids.GetNumberOfIds())):
-                    near.add(seed(c))
-            keep = vtkIdList()
-            for c in range(data.GetNumberOfCells()):
-                if seed(c) in near:
-                    keep.InsertNextId(c)
-            ex = vtkExtractCells()
-            ex.SetInputData(data)
-            ex.SetCellList(keep)
-            geo = vtkGeometryFilter()
-            geo.SetInputConnection(ex.GetOutputPort())
-            geo.Update()
-            lines = TrivialProducer()
-            lines.GetClientSideObject().SetOutput(geo.GetOutput())
-            lines.UpdatePipeline()
-        if lines.GetDataInformation().GetNumberOfPoints() == 0:
-            # nothing traced (no flow field at this time, or no seed in the fluid), or nothing near the
-            # part: show why, don't try to colour an empty result ("could not determine array range")
-            if traced:
-                print('PIFOAM: no pathlines pass within %g mm of the part - increase the distance.' % (CFG['near'] * 1000))
+            cut.Invert = 1
+        except AttributeError:
+            pass
+        grey(Show(cut, view))
+        # framed on the part's outline in the plane (a wing section's chord), else the usual part and wake
+        outline_cut = slice_plane(body, k, at)
+        camera(unit(k), unit(lift), None if empty(outline_cut) else around(outline_cut, 0.6))
+    elif V == 'vortex':
+        # vortex cores: where rotation beats strain, Q = (|Omega|^2 - |S|^2)/2 > CFG['q'], coloured by |U|. Q is
+        # OpenFOAM's (the server computes it before ParaView opens): a gradient over the whole mesh here is slow.
+        # The boundary layer's Q, a sheet over the whole part, is cut away within CFG['clear'] of it
+        internal.UpdatePipeline(scene.AnimationTime)
+        if 'Q' not in internal.PointData.keys():
+            print('PIFOAM: this time step has no Q field - open Vortices from the app again.')
+        else:
+            c = Contour(Input=internal)
+            c.ContourBy = ['POINTS', 'Q']
+            c.Isosurfaces = [CFG['q']]
+            c.UpdatePipeline(scene.AnimationTime)
+            if not empty(c):
+                c = away_from_part(c, CFG['clear'])
+                c.UpdatePipeline()
+            if empty(c):
+                print('PIFOAM: no vortex is that strong away from the part - lower the vortex threshold.')
             else:
-                print('PIFOAM: no pathlines could be traced - solve the case first, and give the domain room upstream.')
-            Show(internal, view).SetRepresentationType('Outline')
+                velocity(Show(c, view))
+        grey(Show(body, view))
+        camera(iso, unit(lift))
+    elif V == 'oilflow':
+        # skin-friction lines, as in an oil-flow test: short light lines along the wall shear stress (computed by the
+        # server before ParaView opens) over the part coloured by its magnitude; lines bunch at separation
+        surf = surface(body)
+        surf.UpdatePipeline(scene.AnimationTime)
+        if 'wallShearStress' not in surf.PointData.keys():
+            print('PIFOAM: this time step has no wallShearStress field - open Oil flow from the app again.')
             grey(Show(body, view))
         else:
-            out = lines
-            try:
-                out = Tube(Input=lines)
-                out.Radius = 0.004 * L
-            except Exception:
-                out = lines
-            velocity(Show(out, view))
-            grey(Show(body, view))
-        camera(iso, unit(lift))
+            color(Show(surf, view), 'wallShearStress', 'Wall shear stress / rho (m2/s2)',
+                  ('Viridis (matplotlib)', 'Turbo'), 'Magnitude', '%-#.3g')
+            pick = MaskPoints(Input=surf)
+            pick.OnRatio = 1
+            pick.MaximumNumberofPoints = CFG.get('npath', 600)
+            pick.RandomSampling = 1
+            pick.GenerateVertices = 1
+            pick.SingleVertexPerCell = 1
+            lines = tracer(surf, pick, 'wallShearStress', 'BOTH', 0.1 * L, on_surface=True)
+            if not empty(lines):
+                d = Show(lines, view)   # crisp lines: tubes on the surface would be half buried in it
+                ink(d, PAPER)   # light on the dark low-shear colours
+                d.LineWidth = 1.5
+        camera(iso, unit(lift), around(body, 0.05))   # the part alone: the lines are on it
     elif V == 'bodyp':
         color_body_p(Show(body_p, view))
         camera(iso, unit(lift))
@@ -776,24 +1120,59 @@ Render()
 """
 
 
-def paraview_script(case, view, near_mm=None):
+def view_extent(g):
+    """(ctr, ext, lo, hi) of the part and domain as ParaView shows them: a half model's solved half plus its
+    reflection across the symmetry plane, else compute_geometry()'s own. Fresh lists."""
+    ctr, ext, lo, hi = (list(g[k]) for k in ("ctr", "ext", "lo", "hi"))
+    if g["sym"]:
+        k, c = g["sym"]
+        mn, mx = min(g["mn"][k], 2 * c - g["mx"][k]), max(g["mx"][k], 2 * c - g["mn"][k])
+        ctr[k], ext[k] = (mn + mx) / 2, mx - mn
+        lo[k], hi[k] = min(g["lo"][k], 2 * c - g["hi"][k]), max(g["hi"][k], 2 * c - g["lo"][k])
+    return ctr, ext, lo, hi
+
+
+def paraview_script(case, view, npath=None, seed=None):
     """pifoam_open.py for one case and preset: CFG header + PARAVIEW_SCRIPT.
     Geometry comes from compute_geometry() on the case's own (metre-scaled)
     part.stl and saved params; without those the script shows the overview.
-    `near_mm` limits the streamlines view to pathlines passing that close to the part."""
+    `npath` is the rake views' number of pathlines, `seed` the pathline, section, vortex and oil-flow form fields
+    (pv_seed_*, pv_near_mm, pv_sec_*, pv_q, pv_oil_n)."""
     cfg = {"view": view}
+    seed = seed or {}
     g = case_geometry(case)
     if g:   # without it (incomplete saved params) the script falls back to the overview
-        cfg.update({k: g[k] for k in ("axis", "sign", "lift_axis", "pitch_axis", "ctr", "ext", "lo", "hi")},
-                   speed=float(read_gui_json(case)["params"].get("speed", 1)))
-        if g["sym"]:   # a half model: the script reflects the result, so frame the part and domain both sides
-            k, c = g["sym"]
-            mn, mx = min(g["mn"][k], 2 * c - g["mx"][k]), max(g["mx"][k], 2 * c - g["mn"][k])
+        ctr, ext, lo, hi = view_extent(g)   # a half model: the script reflects the result, so frame both sides
+        speed = float(read_gui_json(case)["params"].get("speed", 1))
+        cfg.update({k: g[k] for k in ("axis", "sign", "lift_axis", "pitch_axis")},
+                   ctr=ctr, ext=ext, lo=lo, hi=hi, speed=speed)
+        if g["sym"]:   # only when set: the CFG line is read as Python, where JSON's null isn't defined
             cfg["sym"] = g["sym"]
-            cfg["ctr"][k], cfg["ext"][k] = (mn + mx) / 2, mx - mn
-            cfg["lo"][k], cfg["hi"][k] = min(g["lo"][k], 2 * c - g["hi"][k]), max(g["hi"][k], 2 * c - g["lo"][k])
-        if near_mm:
-            cfg["near"] = near_mm / 1000
+        if npath:
+            cfg["npath"] = npath
+        if view in ("rake", "near"):
+            rk = seed_rake(seed, g, npath or 300)
+            cfg.update(seeds=rk["points"], tube=0.12 * rk["spacing"], rake_box=rk["corners"])
+            if view == "near":
+                d = opt_float(seed, "pv_near_mm")
+                if d is not None and d <= 0:
+                    raise ValueError("The maximum distance from the part must be positive.")
+                cfg["near"] = rk["auto_near"] if d is None else d / 1000
+        elif view == "section":
+            sc = seed_section(seed, g)
+            cfg.update(seeds=sc["points"], tube=0.1 * sc["spacing"], plane=[sc["pitch"], sc["plane"]])
+        elif view == "vortex":
+            q = opt_float(seed, "pv_q", 2)
+            if q <= 0:
+                raise ValueError("The vortex threshold must be positive.")
+            # Q (1/s^2) from its dimensionless Q (c/U)^2; the boundary layer within 5 % of the reference length is
+            # left out
+            cfg.update(q=q * (speed / g["lref"]) ** 2, clear=0.05 * g["lref"])
+        elif view == "oilflow":
+            n = opt_float(seed, "pv_oil_n", 600)
+            if not 10 <= n <= 5000 or n != int(n):
+                raise ValueError("Oil-flow lines must be a whole number from 10 to 5000, or blank.")
+            cfg["npath"] = int(n)
     return "CFG = " + json.dumps(cfg) + "\n" + PARAVIEW_SCRIPT
 
 
@@ -805,7 +1184,7 @@ def case_geometry(case):
     if not params or not os.path.isfile(stl):
         return None
     try:
-        return compute_geometry(read_stl(open(stl, "rb").read()), dict(params, scale="1", max_cells="1e18"))
+        return compute_geometry(read_stl(open(stl, "rb").read()), dict(params, scale="1"))
     except (KeyError, ValueError):
         return None
 
@@ -835,7 +1214,7 @@ def snappy_dict(level, s):
         addlayers="true" if layers > 0 else "false",
         layers=f"body {{ nSurfaceLayers {layers}; }}" if layers > 0 else "",
         thickness=thickness, wake_geom=wake_geom, wake_region=wake_region,
-        maxcells=int(s.get("max_cells", 5000000)), nbetween=int(s.get("n_between", 3)),
+        nbetween=int(s.get("n_between", 3)),
         resolve=float(s.get("resolve_angle", 30)))
 
 
@@ -883,7 +1262,9 @@ def read_gui_json(case):
 
 # form fields saved to an existing case as they're edited (no re-setup): only the inputs of the derived
 # flight/stability figures, which never touch the case files. Everything else is a draft until re-created.
-SAVED_PARAMS = ("mass", "mass_unit", "target_sm", "pv_near_mm")
+SAVED_PARAMS = ("mass", "mass_unit", "target_sm", "pv_npath",
+                "pv_seed_dx", "pv_seed_dy", "pv_seed_dz", "pv_seed_w", "pv_seed_h", "pv_seed_gap", "pv_near_mm",
+                "pv_sec_pos", "pv_sec_len", "pv_sec_n", "pv_q", "pv_oil_n")
 
 
 def params_mass_kg(p):
@@ -916,11 +1297,12 @@ def apply_features(p):
 
 
 def case_params(info):
-    """A case's saved form params (gui.json 'params') as they were used: switched-off features neutral. The
-    saved params keep those features' values (the form shows them again); anything computing from them reads here."""
+    """A case's saved form params (gui.json 'params') as they were used: switched-off features neutral, a gas's
+    standard-atmosphere density and viscosity. The saved params keep those features' values (the form shows
+    them again); anything computing from them reads here."""
     params = info.get("params") if isinstance(info.get("params"), dict) else {}
     try:
-        return apply_features(params)
+        return apply_atmosphere(apply_features(params))
     except ValueError:   # a hand-edited, unknown feature key: read it as saved rather than fail
         return dict(params)
 
@@ -1072,10 +1454,6 @@ def compute_geometry(raw_verts, p):
     else:                         # legacy saved params: raw background cell count
         h, level = (size[0] * size[1] * size[2] / float(p["cells"])) ** (1 / 3), int(p["level"])
     n = [max(4, round(size[i] / h)) for i in range(3)]
-    max_cells = int(float(p.get("max_cells") or 5000000))
-    if n[0] * n[1] * n[2] > max_cells:   # e.g. a mm size typed for a metre-scale part: refuse before blockMesh
-        raise ValueError(f"The background mesh would have {n[0] * n[1] * n[2]:,} cells, more than Max cells "
-                         f"({max_cells:,}). Use a larger cell size or fewer cells.")
 
     face = {0: ("(0 4 7 3)", "(1 2 6 5)"), 1: ("(0 1 5 4)", "(3 7 6 2)"), 2: ("(0 3 2 1)", "(4 5 6 7)")}
     mnface, mxface = face[axis][0], face[axis][1]
@@ -1159,6 +1537,25 @@ def compute_geometry(raw_verts, p):
         r, ratio = float(p.get("expansion") or 1.2), 0.5 * surface_cell / first_layer
         layers_suggest = 1 if ratio <= 1 or r <= 1 else min(30, math.ceil(1 + math.log(ratio) / math.log(r)))
 
+    # rough final cell count, for the RAM warning: the background, then around the wetted area A each
+    # refinement level of cell size c adds a band n_between cells thick, ~A·n_between/c² cells (summed over
+    # the levels: 4/3·A·n_between/s² at most), plus the surface cells A/s², one more A/s² per layer, and the
+    # wake box filled at its level. A cut half model meshes only the + side of its plane
+    area, cut = 0.0, half in ("centre", "custom")
+    for k in range(0, len(verts) - 2, 3):
+        t0, t1, t2 = verts[k], verts[k + 1], verts[k + 2]
+        if cut and t0[pitch_axis] + t1[pitch_axis] + t2[pitch_axis] < 3 * root:
+            continue
+        ux, uy, uz = t1[0] - t0[0], t1[1] - t0[1], t1[2] - t0[2]
+        vx, vy, vz = t2[0] - t0[0], t2[1] - t0[1], t2[2] - t0[2]
+        area += 0.5 * math.sqrt((uy * vz - uz * vy) ** 2 + (uz * vx - ux * vz) ** 2 + (ux * vy - uy * vx) ** 2)
+    n_between = int(float(p.get("n_between") or 3))
+    layers = int(float(p.get("layers") or 0))
+    cells_est = (n[0] * n[1] * n[2]
+                 + area / surface_cell ** 2 * (1 + n_between * 4 / 3 * (1 - 4 ** -level) + layers))
+    if wake_cell:
+        cells_est += math.prod(max(0.0, wake_max[i] - wake_min[i]) for i in range(3)) / wake_cell ** 3
+
     return {
         "verts": verts, "mn": mn, "mx": mx, "ext": ext, "axis": axis, "sign": sign,
         "lo": lo, "hi": hi, "size": size, "h": h, "n": n, "level": level,
@@ -1170,6 +1567,7 @@ def compute_geometry(raw_verts, p):
         "ground": ground, "ground_face": ground_face, "half": half, "sym_face": sym_face,
         "first_layer": first_layer, "surface_cell": surface_cell, "layers_suggest": layers_suggest,
         "wake_cell": wake_cell, "sym": None if root is None else [pitch_axis, root],
+        "area": area, "cells_est": cells_est,
     }
 
 
@@ -1184,11 +1582,27 @@ def geometry_summary(g, p):
         "wake_min": g["wake_min"], "wake_max": g["wake_max"], "flow": g["flow"],
         "first_layer": g["first_layer"], "surface_cell": g["surface_cell"], "layers_suggest": g["layers_suggest"],
         "wake_cell": g["wake_cell"], "sym": g["sym"],
+        # meshing memory = cells_est·mem_cell + processes·mem_rank (the browser adds the Run card's processes)
+        "cells_est": g["cells_est"], "mem_cell": MESH_BYTES_PER_CELL, "mem_rank": RANK_BYTES,
+        "ram_avail": available_ram(),
         "q":0.5 * float(p["rho"]) * float(p["speed"]) ** 2,
+        "atm": gas_state(p),   # the standard atmosphere's T, p, rho, nu, a when it sets the fluid (the form shows rho, nu)
         "inlet_turb": {f: val for f, (_, val, _) in turb.items() if f != "nut"},
         "transient": transient_time(p, g) if is_transient(p) else None,
         "probes": parse_probes(p, g),
+        "seed": seed_summary(lambda: seed_rake(p, g, int(opt_float(p, "pv_npath", 300))), g),
+        "section": seed_summary(lambda: seed_section(p, g), g),
     }
+
+
+def seed_summary(fn, g):
+    """fn() - seed_rake() or seed_section() - for the preview, without its points, or seed_frame() + {error}: a
+    ParaView seed setting never blocks the preview or creating the case, and the browser can still draw the seeds
+    once the fields are fixed."""
+    try:
+        return {k: v for k, v in fn().items() if k != "points"}
+    except ValueError as e:
+        return dict(seed_frame(g), error=str(e))
 
 
 def transient_time(p, g):
@@ -1240,6 +1654,102 @@ def parse_probes(p, g):
     return {"points": points, "lines": lines, "npts": npts}
 
 
+def seed_frame(g):
+    """What the pathline rake is placed from, whatever the form says: the whole part's centre as ParaView shows it
+    (`base`), the automatic width (across, along `v`) and height (along `u`) - 1.3 x the part's frontal extents,
+    never past the domain around the centre - and distance upstream of the part's `nose` (half the part's length,
+    at most 80 % of the way to the inlet),
+    the inflow `axis`, and the domain's `inlet` / `outlet` planes; `nose`, `inlet`, `outlet` are coordinates on
+    the `dir` axis `a`, flowing toward `sign`; metres. Also the section view's automatic seed line length
+    `auto_len` (1.3 x the part's height or 0.6 x its length, whichever is more, inside the domain) along the
+    span (`pitch`) axis' normal, and the near-part view's automatic distance `auto_near` (2 % of the part's size).
+    The browser draws the rake and the section live from it."""
+    ctr, ext, lo, hi = view_extent(g)
+    a, li, pi = g["axis"], g["lift_axis"], g["pitch_axis"]
+    sign = 1 if g["flow"][a] > 0 else -1
+    inlet, outlet = (lo[a], hi[a]) if sign > 0 else (hi[a], lo[a])
+    room = lambda k: 2 * 0.98 * min(ctr[k] - lo[k], hi[k] - ctr[k])   # the widest rectangle centred on the part
+    nose = ctr[a] - sign * ext[a] / 2
+    return {"base": ctr, "auto_w": min(1.3 * ext[pi], room(pi)), "auto_h": min(1.3 * ext[li], room(li)),
+            "auto_gap": min(0.5 * ext[a], 0.8 * sign * (nose - inlet)), "nose": nose, "axis": g["flow"],
+            "u": g["lift_dir"], "v": g["pitch_dir"], "a": a, "sign": sign, "inlet": inlet, "outlet": outlet,
+            "pitch": pi, "lift": li, "auto_len": min(room(li), max(1.3 * ext[li], 0.6 * ext[a])), "auto_near": 0.02 * max(ext)}
+
+
+def seed_rake(p, g, n=300):
+    """The 'rake' ParaView view's seeds from the form - pv_seed_dx/dy/dz (the rake centre's offset from
+    seed_frame()'s base; the one along the dir axis is ignored), pv_seed_w, pv_seed_h, pv_seed_gap (its distance
+    upstream of the part's nose); mm, blank: centred, automatic. A rectangle across the inflow (spanned by `v`
+    and `u`), centred where the offset base, moved along the inflow, meets the plane `gap` ahead of the nose; its
+    seeds sit at the centres of an even grid of about n cells, so the pathlines start parallel and evenly spaced:
+    seed_frame() plus {centre, width, height, gap, cols, rows, spacing, corners, points, outside (fraction of the
+    seeds beyond the domain)}, metres."""
+    f = seed_frame(g)
+    _, _, lo, hi = view_extent(g)
+    a, ax, u, v = f["a"], f["axis"], f["u"], f["v"]
+    try:
+        off = [0 if k == a else opt_float(p, f"pv_seed_d{'xyz'[k]}", 0) / 1000 for k in range(3)]
+        w, h, gap = (opt_float(p, f"pv_seed_{k}") for k in ("w", "h", "gap"))
+    except ValueError:
+        raise ValueError("The rake's offsets, size and distance must be numbers.")
+    w, h, gap = (f["auto_" + k] if x is None else x / 1000 for k, x in (("w", w), ("h", h), ("gap", gap)))
+    if w <= 0 or h <= 0 or gap < 0:
+        raise ValueError("The rake's width and height must be positive and its distance upstream at least 0.")
+    plane = f["nose"] - f["sign"] * gap
+    if f["sign"] * (plane - f["inlet"]) <= 0:
+        raise ValueError("The rake lies upstream of the inlet: shorten its distance upstream.")
+    o = [f["base"][k] + off[k] for k in range(3)]
+    c = [o[k] + (plane - o[a]) / ax[a] * ax[k] for k in range(3)]   # the offset base moved along the inflow
+    at = lambda s, t: [c[k] + s * w * v[k] + t * h * u[k] for k in range(3)]   # s, t in [-1/2, 1/2]
+    cols = max(1, round(math.sqrt(n * w / h)))
+    rows = max(1, math.ceil(n / cols))
+    points = [at((i + 0.5) / cols - 0.5, (j + 0.5) / rows - 0.5) for j in range(rows) for i in range(cols)]
+    outside = sum(not all(lo[k] <= q[k] <= hi[k] for k in range(3)) for q in points) / len(points)
+    return dict(f, centre=c, width=w, height=h, gap=gap, cols=cols, rows=rows, spacing=min(w / cols, h / rows),
+                corners=[at(s, t) for s in (-0.5, 0.5) for t in (-0.5, 0.5)], points=points, outside=outside)
+
+
+def seed_section(p, g):
+    """The 'section' ParaView view's plane and seeds from the form - pv_sec_pos (the plane's position along the span,
+    mm from seed_frame()'s base; blank 0), pv_sec_len (the seed line's length, mm; blank: auto_len), pv_sec_n (lines,
+    2-500; blank 40) and the rake's pv_seed_gap (distance upstream of the nose). The plane is normal to the span
+    (pitch) axis; its seeds sit evenly, cell-centred, on a line across the inflow (lift_dir without its span
+    component) in that plane, gap ahead of the nose: seed_frame() plus {plane (coordinate on the pitch axis `pitch`),
+    start, end, spacing, points, outside, box (the domain's cut: {c, u, v, w, h} - centre, lift and flow unit
+    vectors and their extents)}, metres."""
+    f = seed_frame(g)
+    _, _, lo, hi = view_extent(g)
+    a, pi, li = f["a"], f["pitch"], g["lift_axis"]
+    try:
+        pos, ln, gap = (opt_float(p, k) for k in ("pv_sec_pos", "pv_sec_len", "pv_seed_gap"))
+        n = opt_float(p, "pv_sec_n", 40)
+    except ValueError:
+        raise ValueError("The section's position, line height and lines must be numbers.")
+    plane = f["base"][pi] + (pos or 0) / 1000
+    ln = f["auto_len"] if ln is None else ln / 1000
+    gap = f["auto_gap"] if gap is None else gap / 1000
+    if not lo[pi] < plane < hi[pi]:
+        raise ValueError("The section plane lies outside the domain: move its span position toward the part.")
+    if ln <= 0 or gap < 0 or not 2 <= n <= 500 or n != int(n):
+        raise ValueError("The section's line height must be positive, its lines a whole number from 2 to 500.")
+    at_a = f["nose"] - f["sign"] * gap
+    if f["sign"] * (at_a - f["inlet"]) <= 0:
+        raise ValueError("The section's seed line lies upstream of the inlet: shorten the rake's distance upstream.")
+    c = [0.0] * 3
+    c[a], c[pi], c[li] = at_a, plane, f["base"][li]
+    u = [0 if k == pi else f["u"][k] for k in range(3)]   # across the inflow, within the plane
+    nu = math.sqrt(sum(x * x for x in u))
+    u = [x / nu for x in u]
+    n = int(n)
+    points = [[c[k] + ((j + 0.5) / n - 0.5) * ln * u[k] for k in range(3)] for j in range(n)]
+    outside = sum(not all(lo[k] <= q[k] <= hi[k] for k in range(3)) for q in points) / n
+    bc = [(lo[k] + hi[k]) / 2 if k != pi else plane for k in range(3)]
+    unit = lambda i: [1.0 if k == i else 0.0 for k in range(3)]
+    return dict(f, plane=plane, start=[c[k] - ln / 2 * u[k] for k in range(3)],
+                end=[c[k] + ln / 2 * u[k] for k in range(3)], length=ln, n=n, spacing=ln / n, points=points,
+                outside=outside, box={"c": bc, "u": unit(li), "v": unit(a), "w": hi[a] - lo[a], "h": hi[li] - lo[li]})
+
+
 def probe_functions(probes):
     """controlDict function objects for parse_probes() output: 'probes' (U and p at the points, every time
     step: a time history) and 'lines' (U and p along each line, whenever fields are written)."""
@@ -1270,7 +1780,7 @@ def preview_geometry(p):
     and whenever a flow/mesh field changes."""
     if not STATE["verts"]:
         raise ValueError("Choose an STL file first.")
-    p = apply_features(p)
+    p = apply_atmosphere(apply_features(p))
     return geometry_summary(compute_geometry(STATE["verts"], p), p)
 
 
@@ -1385,7 +1895,8 @@ def setup_case(p, verts=None):
     raw_verts = verts or STATE["verts"]
     if not raw_verts:
         raise ValueError("Choose an STL file first.")
-    raw, p = p, apply_features(p)   # written with switched-off features neutral; their values are still saved
+    # written with switched-off features neutral and a gas's standard-atmosphere rho, nu; the form's values are saved
+    raw, p = p, apply_atmosphere(apply_features(p))
     if p.get("sim_type", "external") not in SIM_TYPES:
         raise ValueError(f"Unknown simulation type '{p.get('sim_type')}'.")
     name = case_rel(p.get("case") or "gui_case")
@@ -1476,7 +1987,7 @@ def setup_case(p, verts=None):
               "wake_level": int(p.get("wake_level", 0)),
               "wake_min": g["wake_min"], "wake_max": g["wake_max"],
               "n_between": int(opt("n_between", 3)), "resolve_angle": opt("resolve_angle", 30),
-              "max_cells": int(opt("max_cells", 5000000)), "final_layer": opt("final_layer", 0.3),
+              "final_layer": opt("final_layer", 0.3),
               "min_thick": opt("min_thick", 0.1),
               "first_layer": g["first_layer"] if layer_mode == "yplus" else None}
     w("system/snappyHexMeshDict", snappy_dict(level, snappy))
@@ -1689,11 +2200,13 @@ def folder_leaf(name, what="folder"):
 
 def case_busy(rel):
     """Whether a running or queued job uses this case or (for a folder) any case below it. A sweep is queued
-    under its base case but creates and runs '<base>_sweepN' variants next to it."""
+    under its base case but creates and runs '<base>_sweepN' variants next to it; a solve also runs the case's
+    extra-model cases in its '<case>_models' folder."""
     def uses(job_case, kind):
         if not job_case:
             return False
         return job_case == rel or job_case.startswith(rel + "/") or \
+            re.fullmatch(re.escape(job_case) + r"_models(/.+)?", rel) is not None or \
             (kind == "sweep" and re.fullmatch(re.escape(job_case) + r"_sweep\d+", rel) is not None)
     # JOB["case"] is the running sweep variant; the queue item that started it keeps the base name
     if JOB["running"] and (uses(JOB["case"], JOB["kind"]) or uses(JOB.get("base"), JOB["kind"])):
@@ -1708,6 +2221,76 @@ def busy_error(rel):
 def subtree_depth(rel, path):
     """How many folder levels a folder and everything below it spans (a folder holding only cases: 1)."""
     return 1 + max([r.count("/") - rel.count("/") for k, r, _ in walk(rel) if k == "folder"] or [0])
+
+
+def extra_models(p):
+    """The turbulence models a case is also solved with ('extra_models', space-separated TURB_MODELS keys), in
+    TURB_MODELS order, without the case's own model."""
+    keys = (p.get("extra_models") or "").split()
+    bad = [k for k in keys if k not in TURB_MODELS]
+    if bad:
+        raise ValueError(f"Unknown turbulence model {bad[0]!r}: use {', '.join(TURB_MODELS)}.")
+    own = p.get("turb_model") or "SpalartAllmaras"
+    return [k for k in TURB_MODELS if k in keys and k != own]
+
+
+def model_study_folder(base_case, create=False):
+    """The folder of a case's extra-model cases, '<case>_models' beside it. Refuses a name taken by something
+    else or one nested too deep; create makes it."""
+    rel = base_case + "_models"
+    path = os.path.join(RUN, rel)
+    if os.path.exists(path) and not is_folder(path):
+        raise ValueError(f"'{rel}' exists and is not a folder: rename or move it to solve more turbulence models.")
+    if rel.count("/") + 1 > MAX_FOLDER_DEPTH:
+        raise ValueError(f"More turbulence models need a folder beside '{base_case}', but folders can be nested "
+                         f"at most {MAX_FOLDER_DEPTH} deep. Move the case up a level first.")
+    if create and not is_folder(path):
+        parent, _, leaf = rel.rpartition("/")
+        create_folder(leaf, parent)
+    return rel
+
+
+def model_case(base_case, model):
+    """The case solving base_case's mesh with another turbulence model: '<case>_models/<case>_<short>'."""
+    return f"{base_case}_models/{base_case.rpartition('/')[2]}_{TURB_SHORT[model]}"
+
+
+def model_set(rel):
+    """The cases sharing a mesh as turbulence-model variants, the case itself or one of its extra-model cases
+    given: [{case, model}], the owning case first; [] when it has no extra models."""
+    m = re.fullmatch(r"(.+)_models/([^/]+)", rel)
+    base = m.group(1) if m and m.group(2).startswith(m.group(1).rpartition("/")[2] + "_") else rel
+    info = read_gui_json(os.path.join(RUN, base))
+    try:
+        extra = extra_models(info.get("params") or {})
+    except ValueError:
+        return []
+    out = [{"case": base, "model": info.get("turb_model")}] + [
+        {"case": model_case(base, k), "model": k} for k in extra if is_case(os.path.join(RUN, model_case(base, k)))]
+    return out if len(out) > 1 and any(o["case"] == rel for o in out) else []
+
+
+def setup_with_models(p, verts=None):
+    """setup_case for the form's case, then one case per extra turbulence model (the same settings with that
+    model) in its '<case>_models' folder; Solve runs them on the case's mesh. Everything is checked first."""
+    base, extra = case_rel(p.get("case") or "gui_case"), extra_models(p)
+    if extra:
+        model_study_folder(base)
+        for k in extra:   # each model's own inflow settings (e.g. a k-omega length scale) before anything is written
+            inflow_turbulence(apply_atmosphere(apply_features(dict(p, turb_model=k))))
+    info = setup_case(p, verts)
+    if extra:
+        model_study_folder(base, create=True)
+        for k in extra:
+            setup_case(dict(p, case=model_case(base, k), turb_model=k, extra_models=""), verts)
+    return dict(info, models=[model_case(base, k) for k in extra])
+
+
+def copy_mesh(src, dst):
+    """Give case dst the mesh (and its mesh status) of case src."""
+    shutil.rmtree(os.path.join(dst, "constant/polyMesh"), ignore_errors=True)
+    shutil.copytree(os.path.join(src, "constant/polyMesh"), os.path.join(dst, "constant/polyMesh"))
+    shutil.copy(os.path.join(src, "mesh_status.json"), dst)
 
 
 def create_folder(name, parent=""):
@@ -1898,7 +2481,7 @@ def run_cmd(cmd, cwd, capture=False, force=False, on_line=None):
                          stderr=subprocess.STDOUT, text=True, start_new_session=True)
     JOB["proc"] = p
     m = re.search(r"(\S+) -parallel", cmd)   # the application, also when wrapped in mpirun
-    JOB["meta"]["step"] = m.group(1) if m else cmd.split()[0]
+    JOB["meta"]["step"] = m.group(1) if m else re.sub(r"^unset \w+; ", "", cmd).split()[0]
     chunks = []
     for line in p.stdout:
         log(line)
@@ -1976,6 +2559,9 @@ def queue_snapshot():
 
 SKEW_TOLERATED = 20        # snappyHexMesh's own boundary-face skewness limit (meshQualityDict maxBoundarySkewness)
 SKEW_FACE_FRACTION = 1e-4  # ... for at most this fraction of the faces (and at least 10 faces)
+MAX_REGION_LOSS = 0.05     # keep_flow_region() won't remove more than this fraction of the cells
+# '    Number of regions: 1 (OK).' / '   *Number of regions: 57' (src/meshCheck/checkTopology.C)
+_REGIONS_RE = re.compile(r"^\s*\*?Number of regions:\s*(\d+)", re.M)
 
 
 def mesh_check_text(text):
@@ -1983,13 +2569,18 @@ def mesh_check_text(text):
     'Mesh OK.' / 'Failed N mesh checks.' - see applications/utilities/mesh/manipulation/checkMesh.
     checkMesh flags any face with skewness > 4, but snappyHexMesh accepts up to 20 on the surface, so a
     snappy mesh often 'fails' on a handful of surface faces only. When skewness is the only failed check,
-    for a few faces and within snappy's limit, the mesh counts as ok, with a warning."""
+    for a few faces and within snappy's limit, the mesh counts as ok, with a warning.
+    More than one region is never ok: checkMesh doesn't count it as a failed check, but cells cut off from
+    the inlet and outlet leave the pressure unfixed there, and the solver's first pressure solve crashes."""
+    m = re.search(r"Failed (\d+) mesh checks\.", text)
+    failed = int(m.group(1)) if m else 0
+    r = _REGIONS_RE.search(text)
+    if r and int(r.group(1)) > 1:
+        return "disconnected_regions", failed, []
     if re.search(r"Mesh OK\.", text):
         return "ok", 0, []
-    m = re.search(r"Failed (\d+) mesh checks\.", text)
     if not m:
         return "unknown", 0, []
-    failed = int(m.group(1))
     skew = re.search(r"\*\*\*Max skewness = ([-+\d.eE]+), (\d+) highly skew faces", text)
     faces = re.search(r"^\s*faces:\s+(\d+)", text, re.M)
     if failed == 1 and skew and faces:
@@ -2011,6 +2602,9 @@ def mesh_check_stats(text):
         m = re.search(rf"^\s*{key}:\s+(\d+)", text, re.M)
         if m:
             out[key] = int(m.group(1))
+    m = _REGIONS_RE.search(text)
+    if m:
+        out["regions"] = int(m.group(1))
     m = re.search(rf"non-orthogonality Max: {_F} average: {_F}", text)
     if m:
         out["non_orth"] = {"max": float(m.group(1)), "avg": float(m.group(2)),
@@ -2028,6 +2622,81 @@ def rewrite_snappy_level(case, level):
     info = read_gui_json(case)
     s = info.get("snappy") or {"loc": info.get("loc", [0, 0, 0])}   # pre-layers cases: no layers/wake
     open(os.path.join(case, "system/snappyHexMeshDict"), "w").write(snappy_dict(level, s))
+
+
+def check_mesh(case):
+    """Run checkMesh on the case -> (result, failed checks, warnings, stats), see mesh_check_text/_stats."""
+    rc, text = run_cmd("checkMesh", case, capture=True)
+    return (*mesh_check_text(text), mesh_check_stats(text))
+
+
+def keep_flow_region(case, check):
+    """Repair a mesh split into disconnected regions (cells trapped in gaps between the part's pieces, which
+    touch no inlet or outlet): keep only the region holding snappy's locationInMesh, the one it was asked to
+    mesh. topoSet's regionToCell selects it by the same face connectivity checkMesh counts regions with, so no
+    internal face gets exposed; -patch body keeps subsetMesh from adding an empty 'oldInternalFaces' patch, and
+    subsetMesh maps cellLevel/pointLevel itself. 0/ is left alone (-noFields), so its fields must be uniform.
+    Refuses when the region would lose more than MAX_REGION_LOSS of the cells (loc is then probably not in the
+    flow region). check = check_mesh()'s result. Returns (the new check, {"regions", "cells"} removed), or
+    (check with the reason added to its warnings, None) when refused or failed."""
+    result, failed, warnings, stats = check
+
+    def refuse(why):
+        log(f"\n[mesh repair] {why}\n")
+        return (result, failed, warnings + [why], stats), None
+
+    info = read_gui_json(case)
+    loc = (info.get("snappy") or {}).get("loc") or info.get("loc")
+    if not loc:
+        return refuse("no locationInMesh saved for this case, so the region to keep is unknown; not repaired")
+    zero = os.path.join(case, "0")
+    nonuniform = [f for f in sorted(os.listdir(zero)) if os.path.isfile(os.path.join(zero, f))
+                  and any("nonuniform" in line for line in open(os.path.join(zero, f), errors="replace"))]
+    if nonuniform:
+        return refuse(f"0/{', 0/'.join(nonuniform)} {'is' if len(nonuniform) == 1 else 'are'} nonuniform and would "
+                      "no longer match a repaired mesh; not repaired")
+    regions, cells = stats.get("regions"), stats.get("cells")
+    log(f"\n[mesh repair] {regions} disconnected regions: keeping the one around locationInMesh "
+        f"({' '.join(str(c) for c in loc)})\n")
+    open(os.path.join(case, "system/flowRegionDict"), "w").write(
+        FOAMFILE % ("dictionary", "flowRegionDict") +
+        "actions\n(\n    { name flowRegion; type cellSet; action new; source regionToCell; "
+        f"insidePoints (({' '.join(str(c) for c in loc)})); }}\n);\n")
+    stale = [os.path.join(case, "constant/polyMesh", f) for f in ("sets/flowRegion", "cellProc")]
+
+    def clean():   # the set, and decomposePar's per-cell processor map, number the old cells
+        for f in stale:
+            if os.path.exists(f):
+                os.remove(f)
+
+    rc, text = run_cmd("topoSet -dict system/flowRegionDict -time 0", case, capture=True)
+    kept = re.findall(r"now size (\d+)", text)
+    if rc != 0 or not kept:
+        clean()
+        return refuse("topoSet couldn't select the flow region; not repaired")
+    kept = int(kept[-1])
+    if not cells or cells - kept > MAX_REGION_LOSS * cells:
+        clean()
+        return refuse(f"keeping the region around locationInMesh would remove {(cells or 0) - kept:,} of "
+                      f"{cells or 0:,} cells, more than {MAX_REGION_LOSS:.0%}: locationInMesh is probably not in "
+                      "the flow region; not repaired")
+    # subsetMesh segfaults mapping a refinementHistory (refinementHistory::topoChange), after writing the new
+    # mesh but before cellLevel/pointLevel. snappy doesn't write one; it only serves dynamic unrefinement
+    history = os.path.join(case, "constant/polyMesh/refinementHistory")
+    if os.path.exists(history):
+        os.remove(history)
+    rc = run_cmd("subsetMesh -cellSet flowRegion -patch body -noFields", case)
+    clean()
+    if rc != 0:
+        return refuse("subsetMesh failed while removing the disconnected regions; re-mesh the case")
+    new = check_mesh(case)
+    removed = cells - new[3].get("cells", cells)
+    msg = (f"removed {regions - 1} disconnected region{'s' if regions > 2 else ''} ({removed:,} cells) "
+           "not connected to the flow domain")
+    log(f"\n[mesh repair] {msg}\n")
+    for w_ in new[2]:
+        log(f"\n[mesh check] {w_}\n")
+    return (new[0], new[1], [msg] + new[2], new[3]), {"regions": regions - 1, "cells": removed}
 
 
 def fix_side_patch_type(case):
@@ -2053,16 +2722,20 @@ def read_mesh_status(case):
         return {}
 
 
+def save_mesh_status(case, ms):
+    json.dump(ms, open(os.path.join(case, "mesh_status.json"), "w"))
+
+
 def do_mesh(case, auto_retry=False, max_retries=2, level_bump=1, nprocs=1):
     level = read_gui_json(case).get("level", 3)
     fix_side_patch_type(case)
     history = []
 
-    def write_status(attempt, lvl, result, failed=0, stats=None, warnings=()):
+    def write_status(attempt, lvl, result, failed=0, stats=None, warnings=(), repaired=None):
         history.append({"attempt": attempt, "level": lvl, "result": result, "failed_checks": failed})
-        json.dump({"level": lvl, "attempts": attempt, "last_result": result, "last_failed_checks": failed,
-                   "warnings": list(warnings), "stats": stats or {}, "history": history},
-                  open(os.path.join(case, "mesh_status.json"), "w"))
+        save_mesh_status(case, {"level": lvl, "attempts": attempt, "last_result": result,
+                                "last_failed_checks": failed, "warnings": list(warnings), "stats": stats or {},
+                                "repaired": repaired, "history": history})
 
     for c in ("surfaceCheck constant/geometry/part.stl", "blockMesh", "surfaceFeatures"):
         if JOB["stop"]:
@@ -2092,10 +2765,9 @@ def do_mesh(case, auto_retry=False, max_retries=2, level_bump=1, nprocs=1):
             # record the failure: a stale 'ok' from an earlier mesh would let Mesh + Solve run on this one
             warnings = []
             if rc == 137 and not JOB["stop"]:   # 128 + SIGKILL: the kernel's OOM killer (also via mpirun)
-                warnings = [f"snappyHexMesh ran out of memory at surface level {level}. maxGlobalCells is only "
-                            "checked between refinement iterations, so the mesh can overshoot Max cells by ~1.5×. "
-                            "Lower Max cells, use a coarser surface level/cell size, run fewer MPI processes, "
-                            "or give WSL more memory (memory= in %UserProfile%\\.wslconfig)"]
+                warnings = [f"snappyHexMesh ran out of memory at surface level {level}. Use a coarser surface "
+                            "level/cell size, fewer layers or a smaller wake box, run fewer MPI processes, "
+                            "or give WSL more memory (Mesh → WSL memory)"]
                 log(f"\n[mesh] {warnings[0]}\n")
             write_status(attempt, level, "out_of_memory" if warnings else "snappy_failed", warnings=warnings)
             if nprocs > 1:
@@ -2105,12 +2777,23 @@ def do_mesh(case, auto_retry=False, max_retries=2, level_bump=1, nprocs=1):
             # reconstructPar reconstructs the changed mesh; leave a serial case behind
             if JOB["stop"] or run_cmd("reconstructPar -constant -noFields && rm -rf processor*", case) != 0:
                 return
-        rc, text = run_cmd("checkMesh", case, capture=True)
-        result, failed, warnings = mesh_check_text(text)
-        for w_ in warnings:
+        check = check_mesh(case)
+        for w_ in check[2]:
             log(f"\n[mesh check] {w_}\n")
-        write_status(attempt, level, result, failed, mesh_check_stats(text), warnings)
-        if result == "ok" or not auto_retry or (attempt - 1) >= max_retries or JOB["stop"]:
+        repaired = None
+        if check[0] == "disconnected_regions" and not JOB["stop"]:
+            check, repaired = keep_flow_region(case, check)
+        result, failed, warnings, stats = check
+        if result == "disconnected_regions":
+            # a finer mesh only resolves the gaps better: no auto-retry
+            hint = ("the mesh is still split into disconnected regions, so it can't be solved. They are cells "
+                    "trapped in gaps between the part's pieces: close or overlap those gaps in the geometry, or use "
+                    "a coarser surface cell so snappyHexMesh doesn't mesh into them")
+            log(f"\n[mesh] {hint}\n")
+            warnings = warnings + [hint]
+        write_status(attempt, level, result, failed, stats, warnings, repaired)
+        if result in ("ok", "disconnected_regions") or not auto_retry or (attempt - 1) >= max_retries \
+                or JOB["stop"]:
             return
 
 
@@ -2158,14 +2841,18 @@ def stop_job():
     if first and JOB["running"] and (JOB["meta"] or {}).get("phase") == "solve":
         log("\n[stop] asking the solver to write the current time step and exit (press Stop again to kill)\n")
         request_write_now(os.path.join(RUN, JOB["case"]))   # JOB["case"] is the name; the solver runs in its folder
-    elif JOB["proc"] and JOB["proc"].poll() is None:
+    else:
+        kill_proc()
+
+
+def kill_proc():
+    """Kill the running command (its whole process group, so mpirun's ranks go too)."""
+    if JOB["proc"] and JOB["proc"].poll() is None:
         os.killpg(os.getpgid(JOB["proc"].pid), signal.SIGTERM)
 
 
-def restart_server(grace=120):
-    """Drop the queue, stop the running job (gracefully first, killed after
-    `grace` s), then re-exec this script. The listening socket isn't inherited
-    and HTTPServer reuses the address, so the new process rebinds the port."""
+def stop_everything(grace=120):
+    """Drop the queue and stop the running job (gracefully first, killed after `grace` s), waiting for it."""
     with QUEUE_LOCK:
         QUEUE.clear()
     if JOB["running"]:
@@ -2178,14 +2865,89 @@ def restart_server(grace=120):
             deadline = time.time() + 10
             while JOB["running"] and time.time() < deadline:
                 time.sleep(0.5)
+
+
+def restart_server(grace=120):
+    """Stop everything, then re-exec this script. The listening socket isn't inherited
+    and HTTPServer reuses the address, so the new process rebinds the port."""
+    stop_everything(grace)
     log("\n[restart] restarting the server\n")
     os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
 
+def restart_wsl(grace=120):
+    """Restart WSL so a new .wslconfig applies, and this server with it: stop everything, then hand over to a
+    detached Windows PowerShell in a new console window, which shuts WSL down (ending this process) and starts
+    this script again in the same distro, folder and PIFOAM_* environment. The page reconnects by itself."""
+    info = wsl_info()
+    stop_everything(grace)
+    script = os.path.abspath(__file__)
+    env = [f"{k}={v}" for k, v in os.environ.items() if k.startswith("PIFOAM_")]
+    # --exec: no shell re-parses the arguments, so paths with spaces survive
+    args = ["-d", info["distro"], "--cd", os.path.dirname(script), "--exec", "env", *env,
+            sys.executable, script, *sys.argv[1:]]
+    ps = ("$Host.UI.RawUI.WindowTitle = 'PIFOAM'; Start-Sleep 2; wsl.exe --shutdown; Start-Sleep 3; & wsl.exe " +
+          " ".join("'" + a.replace("'", "''") + "'" for a in args))
+    enc = base64.b64encode(ps.encode("utf-16-le")).decode()
+    log("\n[restart] restarting WSL: PIFOAM starts again in a new window, and this page reconnects\n")
+    rc = subprocess.run([WIN_PS, "-NoProfile", "-Command",
+                         f"Start-Process powershell.exe -ArgumentList '-NoProfile','-EncodedCommand','{enc}'"],
+                        cwd=WIN_CWD, capture_output=True, timeout=60).returncode
+    if rc != 0:
+        log("\n[restart] couldn't start Windows PowerShell to restart WSL. The new memory applies once you run "
+            "'wsl --shutdown' in PowerShell and start PIFOAM again.\n")
+
+
+MESH_INCOMPLETE = ("pre_step_failed", "snappy_failed", "out_of_memory")   # snappy didn't finish
+
+
+def mesh_ready(case):
+    """Solve's mesh guard; logs why, True = go ahead. Refuses a mesh snappy didn't finish (constant/polyMesh is
+    half-built or left over from an earlier mesh) and one split into disconnected regions - repairing it first,
+    as do_mesh does, also for meshes checked before regions were counted. Failed quality checks only warn:
+    such meshes often still solve, and Solve is the manual override for them."""
+    ms = read_mesh_status(case)
+    result, stats = ms.get("last_result"), ms.get("stats") or {}
+    if result in MESH_INCOMPLETE:
+        log(f"\n[solve] not solving: the last mesh run ended in {result.replace('_', ' ')}, so the mesh is "
+            "incomplete or left over from an earlier mesh. Mesh the case again first.\n")
+        return False
+    if result == "failed":
+        names = [label for k, label in (("non_orth", "non-orthogonality"), ("skewness", "skewness"),
+                                        ("aspect", "aspect ratio")) if (stats.get(k) or {}).get("fail")]
+        log(f"\n[solve] warning: the mesh failed {ms.get('last_failed_checks') or 'some'} checkMesh check(s)"
+            f"{' (' + ', '.join(names) + ')' if names else ''}; solving anyway\n")
+    regions, check = stats.get("regions"), (result, ms.get("last_failed_checks", 0), [], stats)
+    fresh = regions is None
+    if fresh:   # meshed before regions were counted, or outside PIFOAM
+        check = check_mesh(case)
+        regions = check[3].get("regions")
+        if regions is None:   # no mesh or checkMesh failed: foamRun reports that itself
+            return True
+        if regions <= 1 and ms:
+            save_mesh_status(case, {**ms, "stats": {**stats, "regions": regions}})   # check once
+    if regions <= 1:
+        return True
+    log(f"\n[solve] the mesh is split into {regions} disconnected regions, which crashes the pressure solve; "
+        "repairing it first\n")
+    (result, failed, warnings, stats), repaired = keep_flow_region(case, check)
+    if (repaired or fresh) and ms:   # a stored unrepairable result is already recorded
+        save_mesh_status(case, {**ms, "last_result": result, "last_failed_checks": failed, "warnings": warnings,
+                                "stats": stats, "repaired": repaired})
+    if result == "disconnected_regions":
+        log("\n[solve] not solving: the mesh is still split into disconnected regions (see above). Close the gaps "
+            "between the part's pieces or use a coarser surface cell, and mesh again.\n")
+        return False
+    return True
+
+
+_NAN_RESIDUAL_RE = re.compile(r"Initial residual = -?(nan|inf)", re.I)   # a solver line of a diverged run
+
+
 def do_solve(case, autostop=None, nprocs=1):
-    if JOB["stop"] or run_cmd("rm -rf postProcessing processor* [1-9]*", case) != 0:
+    fix_side_patch_type(case)   # before checkMesh: it can't read a 'slip' polyPatch either
+    if JOB["stop"] or not mesh_ready(case) or run_cmd("rm -rf postProcessing processor* [1-9]*", case) != 0:
         return
-    fix_side_patch_type(case)
     # a previous auto-stop leaves 'stopAt writeNow' in controlDict; reset it
     if run_cmd("foamDictionary system/controlDict -entry stopAt -set endTime > /dev/null", case) != 0:
         return
@@ -2218,14 +2980,45 @@ def do_solve(case, autostop=None, nprocs=1):
     meta.update(phase="solve", iter=None, iter0=None, t0=time.time(), unit="s" if transient else "it",
                 end=float(end or 0) or None)
 
+    singular = []   # a stack trace through the pressure solver's coarsest level: a singular matrix
+    diverged = []
+
     def progress(line):   # foamRun prints 'Time = 123s' at the start of every iteration
         m = re.match(r"Time = ([-+\d.eE]+)", line)
         if m:
             meta["iter"] = float(m.group(1))
             if meta["iter0"] is None:
                 meta.update(iter0=meta["iter"], t0=time.time())
+        elif "DICPreconditioner::calcReciprocalD" in line or "GAMGSolver::solveCoarsestLevel" in line:
+            singular.append(line)
+        elif not diverged and _NAN_RESIDUAL_RE.search(line):
+            # without floating-point trapping (gamma-Re_theta) a diverging run would carry on with NaNs.
+            # Only this command is killed, not the job: further turbulence models still run
+            diverged.append(line)
+            log("\n[solve] the solution diverged (NaN residuals); stopping this solve.\n")
+            kill_proc()
 
-    run_cmd(par("foamRun", nprocs), case, on_line=progress)
+    foam_run = par("foamRun", nprocs)
+    if info.get("turb_model") == "kOmegaSSTLM":
+        # kOmegaSSTLM::Fthetat divides by the vorticity, exactly 0 in the still-uniform free stream of the
+        # first iterations; OpenFOAM's FPE trapping turns that into a SIGFPE crash, while untrapped y/0 = inf
+        # gives exp(-inf) = 0, the model's intended limit. Divergence is caught by the NaN check above.
+        # OpenFOAM traps whenever FOAM_SIGFPE is set at all (even to false), so it must be unset
+        log("\n[solve] γ-Reθ: floating-point exception trapping off (the transition model divides by the "
+            "vorticity, zero in the uniform free stream)\n")
+        foam_run = "unset FOAM_SIGFPE; " + foam_run
+        snappy = info.get("snappy") or {}
+        if not snappy.get("layers") or snappy.get("first_layer") is None:
+            mesh = "no boundary layers" if not snappy.get("layers") else "layers not sized from y+"
+            own = info.get("case") or ""
+            src = f" (the mesh of {own.split('_models/')[0]})" if "_models/" in own else ""
+            log(f"[solve] warning: γ-Reθ needs a wall-resolved mesh (y+ ≈ 1), this mesh{src} has {mesh}; "
+                "transition will be predicted poorly. Under Mesh, turn on boundary layers with Layer sizing "
+                "'First layer from y+' and Target y+ 1, then re-mesh.\n")
+
+    if run_cmd(foam_run, case, on_line=progress) != 0 and singular and not JOB["stop"]:
+        log("\n[solve] the pressure solve crashed on a singular matrix. Likely cause: the mesh is split into "
+            "disconnected regions (checkMesh's 'Number of regions' above 1), or no pressure reference is set.\n")
     meta.pop("phase", None)
     stop_event.set()
     if watcher:
@@ -2251,6 +3044,24 @@ def do_sample(case, lines, npts):
     run_cmd("foamPostProcess -dict system/sampleLines -latestTime", case)
 
 
+def do_solve_models(case, autostop=None, nprocs=1):
+    """Solve a case, then each of its extra turbulence models (extra_models) on a copy of its mesh."""
+    do_solve(case, autostop, nprocs)
+    base = os.path.relpath(case, RUN)
+    for k in extra_models(read_gui_json(case).get("params") or {}):
+        rel = model_case(base, k)
+        path = os.path.join(RUN, rel)
+        if JOB["stop"] or not os.path.isfile(os.path.join(case, "constant/polyMesh/owner")):
+            return
+        log(f"\n===== {TURB_MODELS[k]}: {rel}, on the mesh of {base} =====\n")
+        if not is_case(path):
+            log(f"[models] {rel} doesn't exist: Create case files again to write it.\n")
+            continue
+        JOB["case"] = rel   # Stop's graceful write goes to the case being solved
+        copy_mesh(case, path)
+        do_solve(path, autostop, nprocs)
+
+
 def do_all(case, mesh_cfg=None, autostop_cfg=None, nprocs=1):
     do_mesh(case, nprocs=nprocs, **(mesh_cfg or {}))
     if JOB["stop"]:
@@ -2258,7 +3069,7 @@ def do_all(case, mesh_cfg=None, autostop_cfg=None, nprocs=1):
     if read_mesh_status(case).get("last_result") != "ok":
         log("\n[mesh+solve] mesh did not pass (or auto-retry was exhausted); skipping solve.\n")
         return
-    do_solve(case, autostop_cfg, nprocs)
+    do_solve_models(case, autostop_cfg, nprocs)
 
 
 def sweep_row_summary(case, avg=AVG_WINDOW):
@@ -2278,11 +3089,11 @@ def do_sweep(base_params, param_name, values, mesh_cfg=None, autostop_cfg=None, 
     base_case = case_rel(base_params.get("case") or "gui_case")   # variants go next to it, in its folder
     table = []
     ref = None   # reference values and axes for the polar / yaw-stability summaries
-    # angle (and, without y+ layer sizing, speed) sweeps don't change the mesh: mesh once, copy it after.
-    # Not with symmetry sides: a tilted variant switches to freestream, a different patch type
+    # angle (and, without y+ layer sizing, speed and altitude) sweeps don't change the mesh: mesh once, copy it
+    # after. Not with symmetry sides: a tilted variant switches to freestream, a different patch type
     side = base_params.get("side_bc") or "slip"
-    reuse = side != "symmetry" and (param_name in ("aoa", "yaw") or
-                                    (param_name == "speed" and base_params.get("layer_mode") != "yplus"))
+    reuse = side != "symmetry" and (param_name in ("aoa", "yaw") or (param_name in ("speed", "altitude")
+                                                                     and base_params.get("layer_mode") != "yplus"))
     mesh_src = None
     JOB["meta"].update(sweep_total=len(values), sweep_index=0, sweep_param=param_name)
     for i, v in enumerate(values):
@@ -2296,7 +3107,10 @@ def do_sweep(base_params, param_name, values, mesh_cfg=None, autostop_cfg=None, 
             p["mesh_preset"] = "count" if param_name == "target_cells" else "surface"
         if param_name in ("aoa", "yaw") and v:
             p["side_bc"] = "freestream"   # a tilted inflow needs far-field sides
+        if param_name == "altitude":
+            p["atmosphere"] = "isa"
         p["case"] = f"{base_case}_sweep{i+1}"
+        p["extra_models"] = ""   # one model per variant
         log(f"\n===== sweep {i+1}/{len(values)}: {param_name}={v} =====\n")
         try:
             info = setup_case(p, verts)
@@ -2307,9 +3121,7 @@ def do_sweep(base_params, param_name, values, mesh_cfg=None, autostop_cfg=None, 
         JOB["case"] = info["case"]
         if mesh_src:
             log(f"[sweep] reusing the mesh of {os.path.basename(mesh_src)} (it doesn't change with {param_name})\n")
-            shutil.rmtree(os.path.join(case, "constant/polyMesh"), ignore_errors=True)
-            shutil.copytree(os.path.join(mesh_src, "constant/polyMesh"), os.path.join(case, "constant/polyMesh"))
-            shutil.copy(os.path.join(mesh_src, "mesh_status.json"), case)
+            copy_mesh(mesh_src, case)
         else:
             do_mesh(case, nprocs=nprocs, **(mesh_cfg or {}))
         row = {"variant": v, "case": info["case"]}
@@ -2339,7 +3151,8 @@ def sweep_ref(case, base_params):
     g, info = case_geometry(case), read_gui_json(case)
     if not g:
         return None
-    return {"S": info["aref"], "c": info["lref"], "b": g["span"], "rho": info["rho"], "speed": info["speed"],
+    return {"S": info["aref"], "c": info["lref"], "b": g["span"], "rho": info["rho"], "nu": info["nu"],
+            "speed": info["speed"],
             "axis": g["axis"], "sign": g["sign"], "lift_axis": g["lift_axis"], "pitch_axis": g["pitch_axis"],
             "cofr": g["cofr"], "aoa": float(case_params({"params": base_params}).get("aoa") or 0)}
 
@@ -2452,6 +3265,34 @@ def yaw_summary(rows, ref):
         if f:
             out[name] = f[0]
     return out
+
+
+def level_summary(rows, ref, mass):
+    """The level-flight speed from a speed sweep's mean lift coefficients: where the lift 1/2 rho V^2 S CL
+    carries the weight m g, with CL at that speed's own Reynolds number rather than one simulated speed's
+    (flight_speed). log L is interpolated linearly in log V (exact for CL ~ V^n) between the variants on
+    either side of the weight, else extended from the nearest two (bracketed False). None without a mass,
+    two variants with lift, or a lift rising with speed there."""
+    if not (ref and mass and mass > 0):
+        return None
+    pts = sorted({float(r["variant"]): r["Cl"] for r in rows if r.get("status") == "done"
+                  and float(r["variant"]) > 0 and r.get("Cl") is not None and r["Cl"] > 0}.items())
+    if len(pts) < 2:
+        return None
+    rho, S, W = ref["rho"], ref["S"], mass * G
+    lift = [0.5 * rho * v * v * S * cl for v, cl in pts]
+    xy, lw = [(math.log(v), math.log(l)) for (v, _), l in zip(pts, lift)], math.log(W)
+    i = next((i for i in range(len(xy) - 1) if xy[i][1] <= lw <= xy[i + 1][1]), None)
+    bracketed = i is not None
+    if not bracketed:   # every lift above the weight: extend the slowest pair, else the fastest
+        i = 0 if lw < xy[0][1] else len(xy) - 2
+    (x0, y0), (x1, y1) = xy[i], xy[i + 1]
+    s = (y1 - y0) / (x1 - x0)   # 2 + n
+    if s <= 0:
+        return None
+    v = math.exp(x0 + (lw - y0) / s)
+    return {"v": v, "cl": 2 * W / (rho * S * v * v), "Re": v * ref["c"] / ref["nu"], "bracketed": bracketed,
+            "weight": W, "points": [{"V": v_, "CL": cl, "L": l} for (v_, cl), l in zip(pts, lift)]}
 
 
 # ---------------------------------------------------------------- results / history parsing
@@ -2750,8 +3591,10 @@ def history(case, avg=AVG_WINDOW, mass=None, avg_time=None):
     flight = None
     if mass and mass > 0 and info.get("aref"):
         cl = (av_coeffs.get("Cl") or {}).get("mean")
-        flight = {"mass": mass, "wing_loading": mass * G / info["aref"],
-                  "v_level": flight_speed(mass, info.get("rho"), info["aref"], cl)}
+        v, speed = flight_speed(mass, info.get("rho"), info["aref"], cl), info.get("speed")
+        # Cl changes with the Reynolds number, so v_level holds only near the speed Cl was simulated at
+        flight = {"mass": mass, "wing_loading": mass * G / info["aref"], "v_level": v, "speed": speed,
+                  "matched": bool(v and speed and abs(v / speed - 1) <= LEVEL_SPEED_TOL)}
     return {
         "coeffs": coeffs,
         "forces": forces,
@@ -2767,6 +3610,7 @@ def history(case, avg=AVG_WINDOW, mass=None, avg_time=None):
         "probes": parse_probe_series(case),
         "lines": parse_line_samples(case),
         "info": info,
+        "models": model_set(os.path.relpath(case, RUN)),
     }
 
 
@@ -2829,10 +3673,17 @@ def results(case, avg=AVG_WINDOW, avg_time=None):
         if fl:
             txt += (f"\nAircraft mass {fl['mass']:g} kg: wing loading {fl['wing_loading']:.4g} N/m2"
                     + (f", level flight at this Cl needs {fl['v_level']:.3g} m/s" if fl["v_level"] else "") + "\n")
+            if fl["v_level"] and not fl["matched"]:
+                txt += (f"  (Cl was simulated at {fl['speed']:g} m/s and changes with the Reynolds number: solve at about "
+                        f"{fl['v_level']:.3g} m/s, or run a speed sweep around it, for the speed at the matching Re)\n")
         cofr = info.get("cofr")
+        prm = case_params(info)
+        atm = gas_state(prm)
         txt += (f"\n(reference area {info.get('aref', 0):.6g} m2, length {info.get('lref', 0):.4g} m"
                 + (", moment reference (" + ", ".join(f"{c:.4g}" for c in cofr) + ") m" if cofr else "")
-                + f", rho {info.get('rho', 0)} kg/m3, nu {nu:g} m2/s, speed {info.get('speed', 0)} m/s, Re {re_:.4g}"
+                + (f", standard atmosphere at {opt_float(prm, 'altitude', 0):g} m ({atm['T'] - 273.15:.1f} C, "
+                   f"{atm['p'] / 100:.1f} hPa)" if atm else "")
+                + f", rho {info.get('rho', 0):.4g} kg/m3, nu {nu:.4g} m2/s, speed {info.get('speed', 0)} m/s, Re {re_:.4g}"
                 + f", {TURB_MODELS.get(info.get('turb_model'), TURB_MODELS['SpalartAllmaras'])}"
                 + (", half model mirrored to the full aircraft" if info.get("half_axis") is not None else "") + ")")
     return {"text": txt}
@@ -2944,6 +3795,12 @@ def report_html(case, avg=AVG_WINDOW, avg_time=None):
         st = ms.get("stats") or {}
         rows = [("Result", e(ms["last_result"])), ("Refinement level / attempts", f"{ms['level']} / {ms['attempts']}")]
         rows += [(k.capitalize(), f"{st[k]:,}") for k in ("cells", "faces", "points") if k in st]
+        if "regions" in st:
+            rep = ms.get("repaired")
+            rows.append(("Regions", f"<span class='{'bad' if st['regions'] > 1 else ''}'>{st['regions']}"
+                                    f"{' (failed)' if st['regions'] > 1 else ''}</span>"
+                                    + (f" ({rep['regions']} disconnected removed, {rep['cells']:,} cells)" if rep
+                                       else "")))
         for k, label in (("non_orth", "Max non-orthogonality (°)"), ("skewness", "Max skewness"),
                          ("aspect", "Max aspect ratio")):
             if k in st:
@@ -2994,7 +3851,7 @@ def case_template(name, keep_name=False):
             # an older resolution mode (legacy preset, cell size + level, cell count, cells across the part,
             # raw cell count) -> the same mesh as background + surface cell size in mm (the Custom mode)
             try:
-                g = compute_geometry(verts, dict(case_params({"params": p}), max_cells="1e18"))   # converting only
+                g = compute_geometry(verts, case_params({"params": p}))
                 p.update(mesh_preset="surface", cell_size_mm=f"{g['h'] * 1000:.6g}",
                          surface_cell_mm=f"{g['h'] * 1000 / 2 ** g['level']:.6g}")
                 for k in ("cells_per_part", "cells", "level", "target_cells"):
@@ -4488,7 +5345,8 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>PIFOAM</title
    sizes, radii, shadows or spacing outside :root.
    Primitives: layout (.grid .split .actions .spacer .scroll) · section .card (unboxed, top rule) + .sub ·
    surface .panel (.sunken, .interactive) · button (primary default, .sec, .ghost, .danger, .sm; :disabled) ·
-   choice .seg / select / .tiles (no dropdown menus) · form field (label + control, .pair, label.check) ·
+   choice .seg / select / .tiles (no dropdown menus) · form field (label + control, .pair, label.check,
+   input.scrub: a number dragged sideways) ·
    .badge .pill .stats>.stat .readout .alert .note progress pre table .caserow · .titleblock (the current case,
    an engineering-drawing title block) · .dropzone .stlcanvas .chartcanvas · .steps · .tip · .ic.
    Data colours for canvases (--c1..--c6 series, --ax-* axes, --geo, --wake) are read by JS tok(). */
@@ -4524,7 +5382,7 @@ h1{font-size:var(--fs-xl);font-weight:700;letter-spacing:-.02em;margin:0;color:v
 main{max-width:calc(var(--w-max) + 2*var(--gutter));margin:0 auto;padding:0 var(--gutter) var(--s7)}
 .hright,.hleft{display:flex;align-items:center;gap:var(--s3)}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:var(--s3)}
-.dropzone+.grid,.grid+.grid,.grid+.tiles{margin-top:var(--s3)}
+.dropzone+.grid,.grid+.grid,.grid~.tiles{margin-top:var(--s3)}
 /* split: a workflow block's settings (left, one field row each) beside what they produce (right, sticky
    under the header while the inputs scroll); stacks under 1000px */
 .split{display:grid;grid-template-columns:minmax(320px,440px) minmax(0,1fr);gap:var(--s3) var(--s7);align-items:start}
@@ -4602,6 +5460,7 @@ input::placeholder{color:var(--mut);opacity:.7}
 input:hover,select:hover{border-color:var(--mut)}
 input:focus,select:focus{border-color:var(--ac);outline:var(--bw-2) solid var(--ac);outline-offset:-1px}
 input:disabled,select:disabled{opacity:.45;cursor:not-allowed}
+input.scrub{cursor:ew-resize;touch-action:none}input.scrub:focus{cursor:text}   /* drag sideways to change: scrub() */
 /* ---- button: primary by default; .sec (supporting), .ghost (tertiary), .danger, .sm. One primary per row ---- */
 button{padding:var(--s2) var(--s4);border:0;border-radius:var(--r-ctl);background:var(--ac);color:var(--on-ac);font:inherit;font-weight:500;letter-spacing:.01em;cursor:pointer;box-shadow:var(--sh-btn);
  transition:background-color var(--t-fast) var(--ease),box-shadow var(--t-fast) var(--ease),color var(--t-fast) var(--ease),transform var(--t-fast) var(--ease)}
@@ -4693,6 +5552,7 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <header class="top" id="top"><div class="wrap">
  <div><div class="hleft"><h1>PIFOAM<small>OpenFOAM 13</small></h1><button class="ghost sm" id="restartbtn" onclick="restartServer()" data-tip="Restarts the PIFOAM server, e.g. to pick up code changes. A running job is stopped first (a solver writes its current fields), queued jobs are dropped, and the page reloads once the server is back.">Restart</button></div><div class="tag" id="tagline">Open a recent case or start a new one.</div></div>
  <div class="hright">
+  <div id="lenunit" class="seg"><button data-u="mm" class="on" data-tip="Show and enter lengths (cell sizes, clearances, positions, domain box, CG, chord, probes, seed rake) in millimetres. Saved cases are unaffected.">mm</button><button data-u="m" data-tip="Show and enter those lengths in metres. Speeds, areas, altitude and fluid properties keep their own units.">m</button></div>
   <div id="uimode" class="seg"><button data-m="basic" class="on" data-tip="Only the essentials: geometry, flow, mesh resolution, then mesh and solve. Hidden settings keep their values and defaults.">Basic</button><button data-m="mid" data-tip="Adds boundary layers, wake refinement, domain size, mesh-retry and auto-stop tuning, and parameter sweeps.">Intermediate</button><button data-m="adv" data-tip="Everything: also inflow turbulence, side-wall type, snappyHexMesh controls and solver numerics.">Advanced</button></div>
   <span id="status" class="pill"><i></i><span id="statustext">Idle</span></span>
  </div>
@@ -4733,7 +5593,7 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <div class="feature panel sunken mid-only" data-feature="half"><div class="feature-h"></div><div class="feature-body">
 <div class="grid">
  <div data-tip="Simulate half of a symmetric part to save cells and time: a symmetry plane cuts the whole part across the span axis (neither the flow nor the lift axis) and only the side above it is meshed and solved. Forces, moments and coefficients are reported for the whole part, and ParaView mirrors the result so every view shows all of it. Not combinable with yaw. Off simulates the full model."><label>Cut plane</label><select id="half_model"><option value="none" selected>Off (full model)</option><option value="centre">Centre of the part</option><option value="custom">Position (mm)</option><option value="min" hidden>Part is one half, root at the span-axis minimum</option><option value="max" hidden>Part is one half, root at the span-axis maximum</option></select></div>
- <div data-when="half_model=custom" data-tip="The cut plane's coordinate on the span axis, in mm in the part's own coordinates (after the STL unit conversion). Use it when the part's plane of symmetry isn't the middle of its bounding box."><label>Cut plane position (mm)</label><input id="half_mm" type="number" step="any" placeholder="required"></div>
+ <div data-when="half_model=custom" data-tip="The cut plane's coordinate on the span axis, in the header's length unit (mm or m), in the part's own coordinates (after the STL unit conversion). Use it when the part's plane of symmetry isn't the middle of its bounding box."><label>Cut plane position (mm)</label><input id="half_mm" data-len="mm" type="number" step="any" placeholder="required"></div>
 </div>
 </div></div>
 <input type="hidden" id="features" value="">
@@ -4744,6 +5604,8 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <div class="sub first">Fluid and inflow</div>
 <div class="grid">
  <div data-tip="Pick a preset fluid to fill in density and viscosity. Editing either value switches this to Custom fluid."><label>Fluid</label><select id="fluid"></select></div>
+ <div id="atmrow" data-tip="The state of a gas: its preset at 20 °C and 1 atm, or the International Standard Atmosphere at an altitude, whose temperature and pressure set the density and viscosity shown below. Typing in either makes the fluid Custom."><label>Atmosphere</label><select id="atmosphere"><option value="lab" selected>20 °C, 1 atm</option><option value="isa">Standard atmosphere (ISA)</option></select></div>
+ <div id="altrow" data-tip="Height above sea level. The standard atmosphere is 15 °C and 1013 hPa at sea level and 6.5 °C colder per km up to 11 km; thinner, colder air lowers the density, so forces drop and flight speeds rise, and changes the Reynolds number. −5 000 to 86 000 m."><label>Altitude (m)</label><input id="altitude" type="number" value="0" step="100" min="-5000" max="86000"></div>
  <div data-tip="Free-stream velocity at the inlet. Sets the Reynolds number and the dynamic pressure that turns coefficients into forces."><label>Flow speed (m/s)</label><input id="speed" type="number" value="15"></div>
  <div data-tip="The axis and sense the flow travels along. The inlet is the domain face upstream of the part, the outlet the face downstream; the arrow in the viewer shows it."><label>Flow direction</label><select id="dir"><option>+x</option><option selected>+y</option><option>+z</option><option>-x</option><option>-y</option><option>-z</option></select></div>
  <div data-tip="Which axis points up in your STL. Lift, the angle of attack, the ground and Cm are measured against it, and the remaining axis is the span (wingspan). CAD tools differ: many export Z up, Fusion 360 and some others Y up. Automatic: Z up, or Y up when the flow runs along Z."><label>Up axis</label><select id="up_axis"><option value="auto" selected>Automatic (Z, or Y)</option><option value="z">Z up</option><option value="y">Y up</option><option value="x">X up</option></select></div>
@@ -4757,27 +5619,27 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <div class="mid-only">
 <div class="feature panel sunken" data-feature="ground"><div class="feature-h"></div><div class="feature-body"><div class="grid">
  <div data-tip="Turns the bottom of the domain (the face below the part along the lift axis) into a wind-tunnel floor at the part's lowest point. Fixed: a still floor. Moving: a belt running at the flow speed, as for a car on the road. Not combinable with an angle of attack."><label>Ground</label><select id="ground"><option value="none" selected>None (free stream)</option><option value="fixed">Fixed floor</option><option value="moving">Moving ground</option></select></div>
- <div class="adv-only" data-tip="Gap between the floor and the part's lowest point, in real millimetres. 0 puts the floor right at the part; a small negative value sinks wheels slightly into the floor, which meshes more reliably than an exact touch."><label>Ground clearance (mm)</label><input id="ground_gap_mm" type="number" value="0" step="any"></div>
+ <div class="adv-only" data-tip="Gap between the floor and the part's lowest point, in real mm or m (the header's length unit), whatever the STL units. 0 puts the floor right at the part; a small negative value sinks wheels slightly into the floor, which meshes more reliably than an exact touch."><label>Ground clearance (mm)</label><input id="ground_gap_mm" data-len="mm" type="number" value="0" step="any"></div>
 </div></div></div>
 <div class="feature panel sunken" data-feature="aircraft"><div class="feature-h"></div><div class="feature-body">
 <div class="grid">
  <div data-tip="What the coefficients are scaled by. Automatic: the part's frontal area, its length along the flow and its centre (fine for cars and bodies). Aircraft: enter the wing area, the mean aerodynamic chord and the CG, so Cl, Cd and Cm compare with other aircraft and the stability figures refer to your CG."><label>Reference values</label><select id="ref_mode"><option value="auto" selected>Automatic (frontal area, length)</option><option value="custom">Aircraft (wing area, chord, CG)</option></select></div>
  <div data-when="ref_mode=custom" data-tip="Wing planform area of the whole aircraft, both wings, in m², in the units after the STL conversion. With a half model still enter the full area."><label>Wing area (m&sup2;)</label><input id="aref" type="number" step="any" min="0"></div>
- <div data-when="ref_mode=custom" data-tip="Mean aerodynamic chord in metres. It scales Cm and the Reynolds number, and the static margin is given as a fraction of it."><label>Mean aerodynamic chord (m)</label><input id="lref" type="number" step="any" min="0"></div>
- <div data-when="ref_mode=custom" data-tip="X coordinate of the centre of gravity, in metres in the part's own coordinates (after the STL unit conversion). Moments are taken about this point. Blank uses the part's centre."><label>CG X (m)</label><input id="cofr_x" type="number" step="any"></div>
- <div data-when="ref_mode=custom" data-tip="Y coordinate of the centre of gravity, in metres. Blank uses the part's centre. With a half model the CG is put on the symmetry plane."><label>CG Y (m)</label><input id="cofr_y" type="number" step="any"></div>
- <div data-when="ref_mode=custom" data-tip="Z coordinate of the centre of gravity, in metres. Blank uses the part's centre."><label>CG Z (m)</label><input id="cofr_z" type="number" step="any"></div>
+ <div data-when="ref_mode=custom" data-tip="Mean aerodynamic chord, in the header's length unit (mm or m). It scales Cm and the Reynolds number, and the static margin is given as a fraction of it."><label>Mean aerodynamic chord (m)</label><input id="lref" data-len="m" type="number" step="any" min="0"></div>
+ <div data-when="ref_mode=custom" data-tip="X coordinate of the centre of gravity, in the header's length unit (mm or m), in the part's own coordinates (after the STL unit conversion). Moments are taken about this point. Blank uses the part's centre."><label>CG X (m)</label><input data-len="m" id="cofr_x" type="number" step="any"></div>
+ <div data-when="ref_mode=custom" data-tip="Y coordinate of the centre of gravity. Blank uses the part's centre. With a half model the CG is put on the symmetry plane."><label>CG Y (m)</label><input data-len="m" id="cofr_y" type="number" step="any"></div>
+ <div data-when="ref_mode=custom" data-tip="Z coordinate of the centre of gravity. Blank uses the part's centre."><label>CG Z (m)</label><input data-len="m" id="cofr_z" type="number" step="any"></div>
  <div data-tip="The aircraft's total flying mass, battery included. It isn't used by the simulation, only to turn the results into wing loading and flight speeds, so you can change it at any time without re-running. Blank = no flight figures."><label>Aircraft mass</label><div class="pair"><input id="mass" type="number" step="any" min="0" placeholder="off" aria-label="Aircraft mass"><select id="mass_unit" aria-label="Mass unit"><option value="g" selected>g</option><option value="kg">kg</option></select></div></div>
 </div>
 <div class="note">Selecting Aircraft starts from the automatic values, so replace them with your wing's.</div>
 </div></div>
 <div class="sub">Turbulence and boundaries</div>
 <div class="grid">
- <div data-tip="Spalart–Allmaras: robust and cheap, fine for attached flow. k-ω SST: better near separation and stall. k-ω SST with transition: also predicts where the boundary layer turns from laminar to turbulent, which matters at RC-model Reynolds numbers (laminar bubbles, lower drag), but needs a near-wall mesh with y+ about 1."><label>Turbulence model</label><select id="turb_model"></select></div>
+ <div data-tip="Spalart–Allmaras: robust and cheap, fine for attached flow. k-ω SST: better near separation and stall. k-ω SST with transition: also predicts where the boundary layer turns from laminar to turbulent, which matters at RC-model Reynolds numbers (laminar bubbles, lower drag), but needs a near-wall mesh with y+ about 1. Tick several to compare them on the same mesh: the first ticked is solved in this case, each other one in its own case with these same settings, in a folder beside this one (name_models/name_SST, …), one after another. Switch between them in the Results heading."><label>Turbulence models</label><div id="turb_models_ui"></div><input type="hidden" id="turb_model" value="SpalartAllmaras"><input type="hidden" id="extra_models" value=""></div>
  <div class="adv-only" data-tip="Inflow turbulence: the turbulent viscosity at the inlet as a multiple of ν (Spalart–Allmaras: ν̃/ν; k-ω models: ν_t/ν, which sets ω). 3 is a typical free-stream value; higher means a more turbulent inflow."><label>Inlet turbulent viscosity ratio</label><input id="nut_ratio" type="number" value="3" step="0.5" min="0"></div>
- <div class="adv-only" data-when="turb_model=kOmegaSST kOmegaSSTLM" data-tip="Turbulence intensity of the incoming air, in percent: velocity fluctuations relative to the flow speed. Calm free flight is about 0.1 %, a wind tunnel 0.2–1 %. With the transition model it also sets where transition starts."><label>Inlet turbulence intensity (%)</label><input id="turb_intensity" type="number" value="0.1" step="0.05" min="0"></div>
- <div class="adv-only" data-when="turb_model=kOmegaSST kOmegaSSTLM" data-tip="How the inlet ω is set. Viscosity ratio: from k and the turbulent viscosity ratio above. Length scale: from k and the size of the incoming eddies, ω = √k / (Cμ^¼ L) — use it when you know the inflow's turbulence scale (e.g. a wind tunnel's grid)."><label>Inlet ω from</label><select id="omega_mode"><option value="ratio">Viscosity ratio</option><option value="length">Length scale</option></select></div>
- <div class="adv-only" data-when="turb_model=kOmegaSST kOmegaSSTLM;omega_mode=length" data-tip="Size of the energy-carrying eddies in the inflow, in mm. Roughly 7 % of a duct's hydraulic diameter, or a few times a wind-tunnel grid's mesh size; free flight is much larger."><label>Inlet turbulence length scale (mm)</label><input id="turb_length_mm" type="number" step="any" min="0" placeholder="required"></div>
+ <div class="adv-only" data-when="turb_model|extra_models=kOmegaSST kOmegaSSTLM" data-tip="Turbulence intensity of the incoming air, in percent: velocity fluctuations relative to the flow speed. Calm free flight is about 0.1 %, a wind tunnel 0.2–1 %. With the transition model it also sets where transition starts."><label>Inlet turbulence intensity (%)</label><input id="turb_intensity" type="number" value="0.1" step="0.05" min="0"></div>
+ <div class="adv-only" data-when="turb_model|extra_models=kOmegaSST kOmegaSSTLM" data-tip="How the inlet ω is set. Viscosity ratio: from k and the turbulent viscosity ratio above. Length scale: from k and the size of the incoming eddies, ω = √k / (Cμ^¼ L) — use it when you know the inflow's turbulence scale (e.g. a wind tunnel's grid)."><label>Inlet ω from</label><select id="omega_mode"><option value="ratio">Viscosity ratio</option><option value="length">Length scale</option></select></div>
+ <div class="adv-only" data-when="turb_model|extra_models=kOmegaSST kOmegaSSTLM;omega_mode=length" data-tip="Size of the energy-carrying eddies in the inflow, in mm. Roughly 7 % of a duct's hydraulic diameter, or a few times a wind-tunnel grid's mesh size; free flight is much larger."><label>Inlet turbulence length scale (mm)</label><input id="turb_length_mm" type="number" step="any" min="0" placeholder="required"></div>
  <div class="adv-only" data-tip="Condition on the side faces of the domain. Slip wall: flow slides along without friction. Symmetry plane: a mirror. Freestream: far field, flow may enter or leave, required for a tilted inflow. None of them grows a boundary layer."><label>Side walls</label><select id="side_bc"><option value="slip" selected>Slip wall</option><option value="symmetry">Symmetry plane</option><option value="freestream">Freestream (far field)</option></select></div>
 </div>
 </div>
@@ -4790,7 +5652,7 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <div id="flightnote" class="note mid-only" data-feat="aircraft"></div>
 <div id="physwarn" style="display:none"></div>
 <div class="note mid-only" data-feat="aircraft">Cm is positive nose-up, about the CG.</div>
-<div class="note" data-when="turb_model=kOmegaSSTLM">The transition model resolves the boundary layer down to the wall: under Mesh, turn on boundary layers with Layer sizing set to First layer from y+ and Target y+ 1. Meshing and solving take noticeably longer.</div>
+<div class="note" data-when="turb_model|extra_models=kOmegaSSTLM">The transition model resolves the boundary layer down to the wall: under Mesh, turn on boundary layers with Layer sizing set to First layer from y+ and Target y+ 1. Meshing and solving take noticeably longer.</div>
 </div></div>
 </section>
 
@@ -4799,14 +5661,25 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <div class="sub first">Resolution</div>
 <div class="grid">
  <div data-tip="A starting point for the two cell sizes below: the surface cell size is fixed (Coarse 4 mm, Medium 2 mm, Fine 1 mm, Very fine 0.5 mm) and the background cell is sized so the domain holds about 150k / 250k / 400k / 600k background cells. Editing either size switches this to Custom."><label>Resolution</label><select id="mesh_preset"><option value="surf4">Coarse (4 mm surface)</option><option value="surf2" selected>Medium (2 mm surface)</option><option value="surf1">Fine (1 mm surface)</option><option value="surf05">Very fine (0.5 mm surface)</option><option value="surface">Custom</option></select></div>
- <div data-tip="Edge length of the background mesh cells in real millimetres, whatever the STL units. It sets how fine the flow is resolved away from the part. Halving it gives about 8× as many background cells. The count shows on the right and must stay under Max cells."><label>Background cell size (mm)</label><input id="cell_size_mm" type="number" value="50" step="any" min="0"></div>
- <div data-tip="The cell size you want on the part's surface, in real millimetres. The refinement level is the fewest halvings of the background cell that reach it, so the actual surface cells (on the right) are this size or a little finer. Smaller resolves curves, thin edges and the boundary layer better, at many more cells. For a wing, aim for 50–100 cells across the chord."><label>Surface cell size (mm)</label><input id="surface_cell_mm" type="number" value="2" step="any" min="0"></div>
+ <div data-tip="Edge length of the background mesh cells in real mm or m (the header's length unit), whatever the STL units. It sets how fine the flow is resolved away from the part. Halving it gives about 8× as many background cells. The count shows on the right and must stay under Max cells."><label>Background cell size (mm)</label><input id="cell_size_mm" data-len="mm" type="number" value="50" step="any" min="0"></div>
+ <div data-tip="The cell size you want on the part's surface, in real mm or m (the header's length unit). The refinement level is the fewest halvings of the background cell that reach it, so the actual surface cells (on the right) are this size or a little finer. Smaller resolves curves, thin edges and the boundary layer better, at many more cells. For a wing, aim for 50–100 cells across the chord."><label>Surface cell size (mm)</label><input id="surface_cell_mm" data-len="mm" type="number" value="2" step="any" min="0"></div>
 </div>
 <div class="note">A preset fills both sizes from the part and domain; change either one to fine-tune it (Custom). The surface refinement level follows from the two.</div>
 </div><div class="effects">
 <div class="sub first">Cell sizes</div>
 <div id="cellinfo" class="note">Load an STL to see the background and refined cell sizes.</div>
 <div id="cellnote" class="note"></div>
+<div id="memwarn" style="display:none"></div>
+<div id="wslmem" data-nodraft style="display:none">
+<div class="sub">WSL memory</div>
+<div id="wslinfo" class="note"></div>
+<div class="grid">
+ <div data-tip="The most memory WSL (and so OpenFOAM) may use, in GB. Blank is WSL's default, half of this PC's RAM. Leave about 4 GB for Windows and the browser."><label>WSL memory (GB)</label><input id="wsl_mem" type="number" step="any" min="1" placeholder="default"></div>
+ <div data-tip="Disk space WSL uses as overflow memory, in GB (0 = off). Blank is WSL's default, a quarter of WSL's memory. A mesh slightly too big for RAM then runs slowly instead of being killed; the swap file takes this much space on C:."><label>Swap (GB)</label><input id="wsl_swap" type="number" step="any" min="0" placeholder="default"></div>
+</div>
+<div class="actions"><button id="wslapply" onclick="applyWslMem()" data-tip="Saves these values to .wslconfig in your Windows user folder and restarts WSL so they apply. A running job is stopped first and queued jobs are dropped.">Apply and restart WSL</button></div>
+<div class="note">WSL reads these only when it starts. Applying restarts it: PIFOAM comes back in a new window and this page reconnects.</div>
+</div>
 </div></div>
 <div class="split mid-only"><div class="inputs">
 <div class="sub first">Boundary layers</div>
@@ -4832,12 +5705,12 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
  <div data-when="domain_mode=relative" data-tip="Gap between the part and the outlet, in part sizes. Leave room for the wake to develop before it reaches the outlet."><label>Downstream (x part size)</label><input id="pad_down" type="number" value="6" step="0.5"></div>
 </div>
 <div class="grid" data-when="domain_mode=absolute">
- <div data-tip="Lower X edge of the domain, in metres in the part's own coordinates (after the STL unit conversion). Must lie below the part."><label>X min (m)</label><input id="dom_x0" type="number" step="any"></div>
- <div data-tip="Upper X edge of the domain, in metres. Must lie beyond the part."><label>X max (m)</label><input id="dom_x1" type="number" step="any"></div>
- <div data-tip="Lower Y edge of the domain, in metres in the part's own coordinates. Must lie below the part."><label>Y min (m)</label><input id="dom_y0" type="number" step="any"></div>
- <div data-tip="Upper Y edge of the domain, in metres. Must lie beyond the part."><label>Y max (m)</label><input id="dom_y1" type="number" step="any"></div>
- <div data-tip="Lower Z edge of the domain, in metres in the part's own coordinates. Must lie below the part."><label>Z min (m)</label><input id="dom_z0" type="number" step="any"></div>
- <div data-tip="Upper Z edge of the domain, in metres. Must lie beyond the part."><label>Z max (m)</label><input id="dom_z1" type="number" step="any"></div>
+ <div data-tip="Lower X edge of the domain, in the header's length unit (mm or m), in the part's own coordinates (after the STL unit conversion). Must lie below the part."><label>X min (m)</label><input data-len="m" id="dom_x0" type="number" step="any"></div>
+ <div data-tip="Upper X edge of the domain. Must lie beyond the part."><label>X max (m)</label><input data-len="m" id="dom_x1" type="number" step="any"></div>
+ <div data-tip="Lower Y edge of the domain, in the header's length unit (mm or m), in the part's own coordinates. Must lie below the part."><label>Y min (m)</label><input data-len="m" id="dom_y0" type="number" step="any"></div>
+ <div data-tip="Upper Y edge of the domain. Must lie beyond the part."><label>Y max (m)</label><input data-len="m" id="dom_y1" type="number" step="any"></div>
+ <div data-tip="Lower Z edge of the domain, in the header's length unit (mm or m), in the part's own coordinates. Must lie below the part."><label>Z min (m)</label><input data-len="m" id="dom_z0" type="number" step="any"></div>
+ <div data-tip="Upper Z edge of the domain. Must lie beyond the part."><label>Z max (m)</label><input data-len="m" id="dom_z1" type="number" step="any"></div>
 </div>
 <div class="note" data-when="domain_mode=absolute">Switching to box coordinates starts from the current domain. The inlet and outlet are still the faces across the flow direction, and the wake box is clipped to the domain. With a ground on, the floor is the min face on the up axis exactly where you put it, and may cut slightly into the part; Ground clearance is not used.</div>
 <div class="sub">Wake refinement</div>
@@ -4852,7 +5725,6 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
  <div data-tip="Buffer cells kept between two refinement levels. More gives smoother size transitions, at the cost of more cells."><label>Cells between levels</label><input id="n_between" type="number" value="3" min="1" max="10"></div>
  <div data-tip="Where the surface bends more sharply than this angle, cells are refined to the full surface level so edges and curves stay crisp. Lower refines more."><label>Resolve feature angle (&deg;)</label><input id="resolve_angle" type="number" value="30" min="0" max="180"></div>
  <div data-tip="Edges where neighbouring STL faces meet at less than this angle are extracted as feature lines the mesh snaps to. 150° catches most real edges; lower ignores gentle ones."><label>Feature included angle (&deg;)</label><input id="feature_angle" type="number" value="150" min="0" max="180"></div>
- <div data-tip="Upper limit on the total number of cells while refining. snappyHexMesh stops refining once it's reached, so it protects your memory. A background mesh already bigger than this is refused."><label>Max cells</label><input id="max_cells" type="number" value="5000000" step="500000" min="10000"></div>
  <div data-tip="Thickness of the outermost boundary layer as a fraction of the neighbouring cell size. Only used with Relative layer sizing."><label>Final layer thickness (rel.)</label><input id="final_layer" type="number" value="0.3" step="0.05" min="0.01"></div>
  <div data-tip="Where layers would be thinner than this they're removed instead: a fraction of the cell size (Relative sizing) or of the first layer height (y+ sizing)."><label>Min layer thickness (rel.)</label><input id="min_thick" type="number" value="0.1" step="0.05" min="0.01"></div>
 </div>
@@ -4871,8 +5743,8 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <div class="feature panel sunken first" data-feature="probes"><div class="feature-h"></div><div class="feature-body">
 <div class="note first">Record the flow at points (a history over the run) and along lines (a profile of the last result), in mm in the part's coordinates after the STL units — the frame of the domain preview.</div>
 <div class="grid">
- <div data-tip="Points where U and p are recorded every iteration or time step, e.g. in the wake to watch it settle or oscillate. Three numbers in mm per point, points separated by ';' (x y z; x y z). Blank = none."><label>Probe points (mm)</label><input id="probe_points" type="text" placeholder="x y z; x y z"></div>
- <div data-tip="Straight lines U and p are sampled along whenever fields are written, e.g. across the wake behind the part. Start and end point in mm per line, lines separated by ';' (x0 y0 z0, x1 y1 z1; …). Lines can also be added after solving with Sample lines in Results. Blank = none."><label>Sample lines (mm)</label><input id="probe_lines" type="text" placeholder="x0 y0 z0, x1 y1 z1"></div>
+ <div data-tip="Points where U and p are recorded every iteration or time step, e.g. in the wake to watch it settle or oscillate. Three numbers per point in the header's length unit (mm or m), points separated by ';' (x y z; x y z). Blank = none."><label>Probe points (mm)</label><input id="probe_points" data-len="mm" type="text" placeholder="x y z; x y z"></div>
+ <div data-tip="Straight lines U and p are sampled along whenever fields are written, e.g. across the wake behind the part. Start and end point per line in the header's length unit (mm or m), lines separated by ';' (x0 y0 z0, x1 y1 z1; …). Lines can also be added after solving with Sample lines in Results. Blank = none."><label>Sample lines (mm)</label><input id="probe_lines" data-len="mm" type="text" placeholder="x0 y0 z0, x1 y1 z1"></div>
  <div data-tip="How many evenly spaced points each sample line is evaluated at."><label>Points per line</label><input id="probe_npts" type="number" value="100" min="2" max="10000"></div>
 </div>
 </div></div>
@@ -4935,7 +5807,7 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
  <button data-ic="both" onclick="act('all')" data-tip="Mesh, then solve, but only if the mesh passes its quality check.">Mesh + Solve</button>
  <button class="danger" data-ic="stop" onclick="act('stop')" data-tip="During solving, the first click asks the solver to save its current fields and stop; a second click kills it. Other jobs stop immediately. Queued jobs still run.">Stop</button>
  <span class="spacer"></span>
- <button class="ghost sm" onclick="$('nprocs').value=CORES[0]" data-tip="Set Processes to the number of physical CPU cores.">Max processes</button>
+ <button class="ghost sm" onclick="$('nprocs').value=CORES[0];$('nprocs').dispatchEvent(new Event('input'))" data-tip="Set Processes to the number of physical CPU cores.">Max processes</button>
  <button class="ghost sm" id="notifybtn" onclick="enableNotify()" data-tip="Show a browser notification and play a beep when a job finishes.">Enable notifications</button>
 </div>
 </div><div class="effects">
@@ -4950,17 +5822,48 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 </div></div>
 </section>
 
-<section class="card locked" id="rescard"><div class="card-h"><h2>Results</h2><p>ParaView views, forces and coefficients</p><span class="spacer"></span><button class="sec sm" onclick="refreshCaseView()" data-tip="Reload this case's results, charts and mesh status. They also refresh on their own while a job runs.">Refresh</button></div>
+<section class="card locked" id="rescard"><div class="card-h"><h2>Results</h2><p>ParaView views, forces and coefficients</p><span class="spacer"></span><div class="seg" id="modelseg" style="display:none" aria-label="Turbulence model"></div><button class="sec sm" onclick="refreshCaseView()" data-tip="Reload this case's results, charts and mesh status. They also refresh on their own while a job runs.">Refresh</button></div>
 <div class="lock-note note">Run the solver to see results here.</div>
 <div class="split"><div class="inputs">
 <div class="actions first"><button class="sec sm" onclick="exportCase('export.csv')" data-tip="Download every iteration's coefficients, forces (N) and moments (N m) as a CSV file for a spreadsheet.">Export CSV</button><button class="sec sm" onclick="exportCase('report')" data-tip="Open a printable report of this case in a new tab: settings, domain, mesh quality, averaged results and convergence charts. Print it to save a PDF.">Case report</button></div>
 <div class="sub">Open in ParaView</div>
 <div class="grid">
- <div data-tip="Flow pathlines only: shows just the pathlines that pass within this distance of the part's surface and hides the rest, so the flow that actually meets the part stands out. Blank shows them all."><label>Pathlines near the part (mm)</label><input id="pv_near_mm" type="number" min="0" placeholder="all"></div>
+ <div data-tip="The Pathlines and Near-part pathlines views: about this many pathlines, from an even grid over the seed rake below, traced downstream. More shows finer detail but is slower and busier."><label>Number of pathlines</label><input id="pv_npath" type="number" min="10" max="5000" step="1" placeholder="300"></div>
+</div>
+<div class="sub">Seed rake</div>
+<div class="note first">For Pathlines and Near-part pathlines: a rectangle across the inflow just upstream of the part, drawn beside these fields with its seeds as you drag or type in them. The pathlines start evenly spaced on it and run downstream past the part; seeds outside the domain trace nothing.</div>
+<div class="grid">
+ <div data-when="dir=+y -y +z -z" data-tip="Moves the rake's centre this far along X from the centre of the part's bounding box. Blank: 0. Drag sideways inside the box to change it (hold Shift for fine steps), or click to type."><label>Offset X (mm)</label><input data-len="mm" id="pv_seed_dx" type="number" step="any" placeholder="0"></div>
+ <div data-when="dir=+x -x +z -z" data-tip="Moves the rake's centre this far along Y from the centre of the part's bounding box. Blank: 0. Drag sideways inside the box to change it (hold Shift for fine steps), or click to type."><label>Offset Y (mm)</label><input data-len="mm" id="pv_seed_dy" type="number" step="any" placeholder="0"></div>
+ <div data-when="dir=+x -x +y -y" data-tip="Moves the rake's centre this far along Z from the centre of the part's bounding box. Blank: 0. Drag sideways inside the box to change it (hold Shift for fine steps), or click to type."><label>Offset Z (mm)</label><input data-len="mm" id="pv_seed_dz" type="number" step="any" placeholder="0"></div>
+ <div data-tip="The rake's size across the span (side to side). Blank: a little wider than the part, inside the domain. Drag sideways inside the box to change it, starting from the automatic size (hold Shift for fine steps), or click to type."><label>Width (mm)</label><input data-len="mm" id="pv_seed_w" type="number" step="any" min="0" placeholder="auto"></div>
+ <div data-tip="The rake's size along the up (lift) axis. Blank: a little taller than the part, inside the domain. Drag sideways inside the box to change it, starting from the automatic size (hold Shift for fine steps), or click to type."><label>Height (mm)</label><input data-len="mm" id="pv_seed_h" type="number" step="any" min="0" placeholder="auto"></div>
+ <div data-tip="How far ahead of the part's front the rake sits, along the flow. Blank: half the part's length. Close keeps the lines straight and parallel until they reach the part. Drag sideways inside the box to change it, starting from the automatic distance (hold Shift for fine steps), or click to type."><label>Distance upstream (mm)</label><input data-len="mm" id="pv_seed_gap" type="number" step="any" min="0" placeholder="auto"></div>
+ <div data-tip="Near-part pathlines: only the rake's pathlines that come at least this close to the part are drawn, so the free stream passing it by is left out. Blank: 2 % of the part's size. Drag sideways inside the box to change it, starting from the automatic distance (hold Shift for fine steps), or click to type."><label>Max distance from part (mm)</label><input data-len="mm" id="pv_near_mm" type="number" step="any" min="0" placeholder="auto"></div>
+</div>
+<div id="seedwarn" style="display:none"></div>
+<div class="sub">Section</div>
+<div class="note first">For Section pathlines: a plane across the span, coloured by |U|, with the flow along it traced from a line of seeds the rake's distance upstream of the part. Both are drawn dashed beside these fields; the view looks at the part's cut outline in the plane.</div>
+<div class="grid">
+ <div data-tip="Where the plane cuts the span, measured from the centre of the part's bounding box (side to side). Blank: 0, the middle. Drag sideways inside the box to change it (hold Shift for fine steps), or click to type."><label>Span position (mm)</label><input data-len="mm" id="pv_sec_pos" type="number" step="any" placeholder="0"></div>
+ <div data-tip="The seed line's length along the up (lift) axis, centred on the part. Blank: a little taller than the part, or 0.6 x its length if that is more, inside the domain. Drag sideways inside the box to change it, starting from the automatic size (hold Shift for fine steps), or click to type."><label>Line height (mm)</label><input data-len="mm" id="pv_sec_len" type="number" step="any" min="0" placeholder="auto"></div>
+ <div data-tip="How many section lines start, evenly spaced along the seed line: 2 to 500."><label>Section lines</label><input id="pv_sec_n" type="number" min="2" max="500" step="1" placeholder="40"></div>
+</div>
+<div id="sectionwarn" style="display:none"></div>
+<div class="sub">Vortices and oil flow</div>
+<div class="grid">
+ <div data-tip="Vortices: surfaces where rotation beats strain by this much, as the dimensionless Q (c/U)&sup2; with c the reference length (MAC) and U the flow speed. Lower shows weaker vortices (and more noise), higher only the strongest cores. The boundary layer on the part is left out. Blank: 2."><label>Vortex threshold</label><input id="pv_q" type="number" step="any" min="0" placeholder="2"></div>
+ <div data-tip="Oil flow: how many skin-friction lines start on the part, spread over its surface and traced both ways along the wall shear stress. Lines bunch where the flow separates or reattaches. 10 to 5000; blank: 600."><label>Oil-flow lines</label><input id="pv_oil_n" type="number" min="10" max="5000" step="1" placeholder="600"></div>
 </div>
 <div id="pvbtns" class="tiles"></div>
-<div class="note">Pressure is shown as Cp = p / (&frac12; U&sup2;) and velocity as |U|, each coloured over its own range at the shown iteration.</div>
-<div class="sub">Forces and coefficients</div>
+<div class="note">Pressure is shown as Cp = p / (&frac12; U&sup2;) and velocity as |U|, each coloured over its own range at the shown iteration. Vortices and Oil flow first compute Q or the wall shear stress into the last time (a few seconds, once; not while a job uses the case).</div>
+</div><div class="effects">
+<div class="actions first"><div id="seedmode"></div><span class="spacer"></span><div id="seedviews"></div></div>
+<canvas id="seedview" width="720" height="380" class="stlcanvas"></canvas>
+<div class="note">The domain preview from the Mesh card, with the seed rake and the section's plane and seed line dashed, their seeds as dots: seeds outside the translucent domain box trace nothing.</div>
+</div></div>
+<div class="split"><div class="inputs">
+<div class="sub first">Forces and coefficients</div>
 <div class="grid">
  <div data-when="sim_type=external" data-tip="A steady run still wobbles a little at the end, so results are reported as the mean over this many final iterations, with their min–max range. Larger smooths more; it shouldn't reach back into the start-up transient."><label>Average over last (iterations)</label><input id="avg_window" type="number" value="100" min="1"></div>
  <div data-when="sim_type=transient" data-tip="Transient results are time-weighted means over this many final seconds of simulated time, with their min–max range, and the Strouhal number is measured in the same window. Blank: the last half of the run. Keep it clear of the start-up transient and long enough for several shedding cycles."><label>Average over last (s)</label><input id="avg_time" type="number" step="any" min="0" placeholder="last half"></div>
@@ -5003,11 +5906,11 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <section class="card mid-only" id="studycard"><div class="card-h"><h2>Studies</h2><p>Parameter sweeps and mesh independence, one new case per value</p><span class="spacer"></span><div class="seg" data-fseg="studies"></div></div>
 <div class="split" data-feat="studies"><div class="inputs">
 <div class="grid">
- <div data-tip="The setting to vary across cases. Mesh resolution, cell size or cell count gives a mesh-independence study: Cd should settle as the cell count grows. Everything else is copied from the form."><label>Vary</label><select id="sweep_param"><option value="speed">Flow speed (m/s)</option><option value="dir">Flow direction</option><option value="aoa">Angle of attack (&deg;)</option><option value="yaw">Yaw (&deg;)</option><option value="mesh_preset">Mesh resolution (coarse, medium, fine, very fine)</option><option value="cell_size_mm">Background cell size (mm)</option><option value="surface_cell_mm">Surface cell size (mm)</option><option value="target_cells">Background cell count</option></select></div>
+ <div data-tip="The setting to vary across cases. Mesh resolution, cell size or cell count gives a mesh-independence study: Cd should settle as the cell count grows. Everything else is copied from the form."><label>Vary</label><select id="sweep_param"><option value="speed">Flow speed (m/s)</option><option value="dir">Flow direction</option><option value="aoa">Angle of attack (&deg;)</option><option value="yaw">Yaw (&deg;)</option><option value="altitude">Altitude (m, standard atmosphere)</option><option value="mesh_preset">Mesh resolution (coarse, medium, fine, very fine)</option><option value="cell_size_mm">Background cell size (mm)</option><option value="surface_cell_mm">Surface cell size (mm)</option><option value="target_cells">Background cell count</option></select></div>
  <div data-tip="Comma-separated values. Each becomes its own case (name_sweep1, name_sweep2, …), meshed and solved in turn."><label>Values (comma-separated)</label><input id="sweep_values" placeholder="e.g. 10,15,20"></div>
  <div data-feat="aircraft" data-tip="The static margin you want, in percent of the mean chord: how far the CG sits ahead of the neutral point. 5–15 % is typical for RC models; more is steadier but needs more elevator. Used to suggest a CG position after an angle-of-attack sweep."><label>Target static margin (%)</label><input id="target_sm" type="number" value="10" step="1"></div>
 </div>
-<div class="note">Angle of attack sweeps give the polars, the neutral point and, with an aircraft mass, flight speeds. Yaw sweeps (full model) give the directional and roll stability. Angle and speed sweeps mesh once and reuse that mesh.</div>
+<div class="note">Angle of attack sweeps give the polars, the neutral point and, with an aircraft mass, flight speeds. Speed sweeps, with an aircraft mass, give the level-flight speed at its own Reynolds number. Altitude sweeps (a gas) put each case in the standard atmosphere at that height. Yaw sweeps (full model) give the directional and roll stability. Angle, speed and altitude sweeps mesh once and reuse that mesh. To compare turbulence models, tick them under Physics → Also solve with.</div>
 <div class="actions"><button onclick="runSweep()" data-tip="Queue the sweep. Each variant's results are averaged over the last iterations set under Results.">Run sweep</button></div>
 </div><div class="effects">
 <div id="sweepprogress" class="note">No sweep run yet.</div>
@@ -5015,7 +5918,7 @@ summary{cursor:pointer;font-size:var(--fs-sm);color:var(--mut);margin-top:var(--
 <div id="aerostats" data-feat="aircraft"></div>
 <div id="aeronote" class="note" data-feat="aircraft"></div>
 <div class="actions"><div id="sweepseg" class="seg"></div></div>
-<canvas id="sweepchart" width="600" height="210" class="chartcanvas" style="display:none" data-tip="The sweep's results per variant. For a mesh study Cd is plotted against the cell count: once it stops changing as cells are added, the coarser mesh is fine enough. Angle sweeps offer the polars, yaw sweeps the stability curves."></canvas>
+<canvas id="sweepchart" width="600" height="210" class="chartcanvas" style="display:none" data-tip="The sweep's results per variant. For a mesh study Cd is plotted against the cell count: once it stops changing as cells are added, the coarser mesh is fine enough. Angle sweeps offer the polars, yaw sweeps the stability curves, and speed sweeps with an aircraft mass the lift against the weight: level flight is where they cross."></canvas>
 </div></div>
 </section>
 </div>
@@ -5186,6 +6089,16 @@ function makeViewer(canvas,opts){
         pdot(a);pdot(b);halo(m.label,b[0]+7,b[1]+4);continue;
       }
       if(m.kind==='probe'){pdot(proj(rot(m.c)));const s=proj(rot(m.c));halo(m.label,s[0]+7,s[1]+4);continue;}
+      if(m.kind==='rect'){   /* seed rake or section: dashed rectangle (w 0: a line), a dot per seed of its cols x rows
+                               grid (none when 0; seed_rake()'s / seed_section()'s), labelled at a corner */
+        const at=(s,t)=>proj(rot([0,1,2].map(k=>m.c[k]+s*m.w*m.v[k]+t*m.h*m.u[k])));
+        ctx.strokeStyle=fg;ctx.lineWidth=1.25;ctx.setLineDash([5,4]);ctx.beginPath();
+        [[-1,-1],[1,-1],[1,1],[-1,1],[-1,-1]].forEach(([s,t],i)=>{const q=at(s/2,t/2);i?ctx.lineTo(q[0],q[1]):ctx.moveTo(q[0],q[1]);});
+        ctx.stroke();ctx.setLineDash([]);
+        ctx.fillStyle=fg;
+        for(let j=0;j<m.rows;j++)for(let i=0;i<m.cols;i++){const q=at((i+0.5)/m.cols-0.5,(j+0.5)/m.rows-0.5);ctx.fillRect(q[0]-0.75,q[1]-0.75,1.5,1.5);}
+        const s=at(0.5,0.5);halo(m.label,s[0]+7,s[1]+4);continue;
+      }
       /* CG roundel: quartered circle at a constant screen size, drawn over everything so the part never hides it */
       const s=proj(rot(m.c)),r=7,light=fg,dark=css('--bg');
       for(let q=0;q<4;q++){
@@ -5215,14 +6128,20 @@ function makeViewer(canvas,opts){
     drawFlow(proj);
     if(!opts.static)drawTriad(w,h);
   }
+  /* opts.mirrors: more canvases showing this same view - each frame is rendered once, then copied into them */
+  const mirrors=opts.mirrors||[];
+  function mirror(){for(const m of mirrors){m.width=canvas.width;m.height=canvas.height;m.getContext('2d').drawImage(canvas,0,0);}}
   let queued=false;
-  const redraw=()=>{if(queued)return;queued=true;requestAnimationFrame(()=>{queued=false;render();});};
-  /* framing: part alone -> centroid/max distance; with boxes -> union bounding box */
+  const redraw=()=>{if(queued)return;queued=true;requestAnimationFrame(()=>{queued=false;render();mirror();});};
+  /* framing: part alone -> centroid/max distance; with boxes or seed rectangles -> union bounding box */
   function frame(){
-    if(boxes.length){
+    const rects=marks.filter(m=>m.kind==='rect');
+    if(boxes.length||rects.length){
       const mn=[Infinity,Infinity,Infinity],mx=[-Infinity,-Infinity,-Infinity];
       const grow=p=>{for(let d=0;d<3;d++){mn[d]=Math.min(mn[d],p[d]);mx[d]=Math.max(mx[d],p[d]);}};
       boxes.forEach(b=>{grow(b.min);grow(b.max);});verts.forEach(grow);
+      for(const m of rects)for(const s of [-0.5,0.5])for(const t of [-0.5,0.5])   /* the rectangles' corners */
+        grow([0,1,2].map(d=>m.c[d]+s*m.w*m.v[d]+t*m.h*m.u[d]));
       center=[0,1,2].map(d=>(mn[d]+mx[d])/2);radius=Math.hypot(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2])/2||1;
     }else if(verts.length){
       let cx=0,cy=0,cz=0;verts.forEach(p=>{cx+=p[0];cy+=p[1];cz+=p[2];});
@@ -5233,7 +6152,10 @@ function makeViewer(canvas,opts){
   }
   if(!opts.static){   /* opts.static: a thumbnail, drawn once at its size, no interaction */
     window.addEventListener('resize',redraw);
-    canvas.onmousedown=e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;};
+    for(const c of [canvas,...mirrors]){   /* dragging or zooming a mirror turns the one shared view */
+      c.onmousedown=e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;};
+      c.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(0.2,Math.min(5,zoom*(e.deltaY<0?1.1:0.9)));redraw();},{passive:false});
+    }
     window.addEventListener('mouseup',()=>dragging=false);
     window.addEventListener('mousemove',e=>{
       if(!dragging)return;
@@ -5241,7 +6163,6 @@ function makeViewer(canvas,opts){
       R=matMul(matMul(ry((e.clientX-lastX)*0.01),rx((e.clientY-lastY)*0.01)),R);
       lastX=e.clientX;lastY=e.clientY;redraw();
     });
-    canvas.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(0.2,Math.min(5,zoom*(e.deltaY<0?1.1:0.9)));redraw();},{passive:false});
   }
   return {
     setMode(m){mode=m;redraw();},
@@ -5249,9 +6170,9 @@ function makeViewer(canvas,opts){
     redraw,
     set(v){verts=v||[];frame();redraw();},
     setBoxes(b){boxes=b||[];frame();redraw();},
-    /* [{c, label}]: CG roundels; {c, label, kind:'probe'}: probe dots; {c, b, label}: sample lines.
-       Not part of the framing */
-    setMarkers(m){marks=m||[];redraw();},
+    /* [{c, label}]: CG roundels; {c, label, kind:'probe'}: probe dots; {c, b, label}: sample lines;
+       {c, u, v, w, h, cols, rows, label, kind:'rect'}: the ParaView seed rake and section, the only markers framed */
+    setMarkers(m){marks=m||[];frame();redraw();},
   };
 }
 /* Iso/+-X/+-Y/+-Z view buttons and a Solid/Wireframe toggle, built for any viewer */
@@ -5260,10 +6181,11 @@ function viewBar(el,viewer){
   el.innerHTML=['iso','+X','-X','+Y','-Y','+Z','-Z'].map(v=>'<button data-v="'+v+'">'+(v==='iso'?'Iso':v.replace('-','&minus;'))+'</button>').join('');
   el.querySelectorAll('button').forEach(b=>b.onclick=()=>viewer.view(b.dataset.v));
 }
-function modeBar(el,viewer){
-  el.className='seg';
-  el.innerHTML='<button class="on" data-m="solid">Solid</button><button data-m="wire">Wireframe</button>';
-  el.querySelectorAll('button').forEach(b=>b.onclick=()=>{viewer.setMode(b.dataset.m);el.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));});
+/* els: every bar showing this viewer's mode (one per mirror), kept in step */
+function modeBar(els,viewer){
+  els.forEach(el=>{el.className='seg';el.innerHTML='<button class="on" data-m="solid">Solid</button><button data-m="wire">Wireframe</button>';});
+  const all=els.flatMap(el=>[...el.querySelectorAll('button')]);
+  all.forEach(b=>b.onclick=()=>{viewer.setMode(b.dataset.m);all.forEach(x=>x.classList.toggle('on',x.dataset.m===b.dataset.m));});
 }
 /* inflow for the viewer arrow: the dir axis tilted by angle of attack (toward the up/lift axis, liftAxis())
    and yaw (toward the remaining axis) - mirrors compute_geometry() */
@@ -5278,9 +6200,11 @@ function flowDir(){
   return {d,ax,label:dir+(tilt?' ('+tilt+')':'')};
 }
 const physView=makeViewer($('physview'),{flowDir});
-const domView=makeViewer($('domview'),{flowDir});
+/* the domain preview, also shown beside the Results card's seed rake fields (#seedview, a mirror) */
+const domView=makeViewer($('domview'),{flowDir,mirrors:[$('seedview')]});
 const VIEWERS=[physView,domView];
-[[physView,'phys'],[domView,'dom']].forEach(([v,k])=>{viewBar($(k+'views'),v);modeBar($(k+'mode'),v);});
+viewBar($('physviews'),physView);modeBar([$('physmode')],physView);
+viewBar($('domviews'),domView);viewBar($('seedviews'),domView);modeBar([$('dommode'),$('seedmode')],domView);
 let PART_BOX=null;   /* the previewed part's bounding box (STL file units), framing the Physics view's planes */
 /* the loaded part's preview (file units) into both viewers; always the whole part, also for a half model */
 function setPreview(v){
@@ -5300,6 +6224,36 @@ function boundaryFaces(){
   if(half!=='none')faces[(half==='max'?'+':'-')+spanAxis(ax)]={color:GEO_COL,alpha:0.3,label:'symmetry'};
   return faces;
 }
+/* the domain preview's probe and sample-line markers (file units), kept so the seed markers can be redrawn alone */
+let DOM_MARKS=[];
+/* the seed rake and the section from the last preview's seed_frame() (base centre, automatic sizes, nose, axes;
+   metres) and the fields as they are now - mirrors seed_rake() and seed_section(), so typing or dragging redraws
+   them without a server round trip */
+function drawSeed(r=LAST_PREVIEW){
+  const sc=r&&r.seed,s=+$('scale').value||1,mv=id=>(+$(id).value||0)/1000;   /* the fields are mm */
+  const auto=(id,k)=>$(id).value===''?sc[k]:mv(id),size=k=>auto('pv_seed_'+k,'auto_'+k);
+  const marks=[];
+  if(sc&&sc.base){
+    const w=size('w'),h=size('h'),gap=size('gap'),a=sc.a,ax=sc.axis,n=+$('pv_npath').value||300;
+    /* the offset base (none along the dir axis) moved along the inflow onto the plane gap ahead of the nose */
+    const o=sc.base.map((b,k)=>k===a?b:b+mv('pv_seed_d'+'xyz'[k])),plane=sc.nose-sc.sign*gap;
+    const c=o.map((q,k)=>q+(plane-o[a])/ax[a]*ax[k]);
+    if(w>0&&h>0&&gap>=0){const cols=Math.max(1,Math.round(Math.sqrt(n*w/h)));
+      marks.push({c:c.map(q=>q/s),u:sc.u,v:sc.v,w:w/s,h:h/s,cols,rows:Math.max(1,Math.ceil(n/cols)),label:'seeds',kind:'rect'});}
+    /* the section: the domain cut by the span-axis plane, and its seed line across the inflow (lift_dir without its
+       span component) gap ahead of the nose */
+    const pi=sc.pitch,li=sc.lift,ln=auto('pv_sec_len','auto_len'),ns=+$('pv_sec_n').value||40,at=sc.base[pi]+mv('pv_sec_pos');
+    const lo=r.domain_min,hi=r.domain_max,unit=i=>[0,1,2].map(k=>k===i?1:0);
+    if(lo&&at>lo[pi]&&at<hi[pi]){
+      marks.push({c:[0,1,2].map(k=>(k===pi?at:(lo[k]+hi[k])/2)/s),u:unit(li),v:unit(a),w:(hi[a]-lo[a])/s,h:(hi[li]-lo[li])/s,
+        cols:0,rows:0,label:'section',kind:'rect'});
+      const u=sc.u.map((q,k)=>k===pi?0:q),nu=Math.hypot(...u)||1;
+      if(ln>0&&gap>=0)marks.push({c:[0,1,2].map(k=>(k===a?plane:k===pi?at:sc.base[k])/s),u:u.map(q=>q/nu),v:unit(pi),
+        w:0,h:ln/s,cols:1,rows:Math.max(2,Math.round(ns)),label:'section seeds',kind:'rect'});
+    }
+  }
+  domView.setMarkers(DOM_MARKS.concat(marks));
+}
 /* domain preview boxes from a /api/preview or /api/setup response (metres -> STL file units); the Physics
    view gets only the ground/symmetry faces of the domain and a small box at the moment reference (CG) */
 function setDomainBoxes(r){
@@ -5308,10 +6262,10 @@ function setDomainBoxes(r){
   const faces={[inlet]:{color:col,alpha:0.22,label:'inlet'},[outlet]:{color:GEO_COL,alpha:0.14,label:'outlet'},...boundaryFaces()};
   const boxes=[{min:u(r.domain_min),max:u(r.domain_max),color:GEO_COL,alpha:0.08,faces}];
   if(+$('wake_level').value>0&&r.wake_min)boxes.push({min:u(r.wake_min),max:u(r.wake_max),color:WAKE_COL,alpha:0.12,label:'wake'});
-  domView.setBoxes(boxes);
   const pr=r.probes||{points:[],lines:[]};   /* probe points and sample lines (metres) as markers */
-  domView.setMarkers(pr.points.map(q=>({c:u(q.at),label:q.name,kind:'probe'}))
-    .concat(pr.lines.map(l=>({c:u(l.start),b:u(l.end),label:l.name.replace('line','L')}))));
+  DOM_MARKS=pr.points.map(q=>({c:u(q.at),label:q.name,kind:'probe'}))
+    .concat(pr.lines.map(l=>({c:u(l.start),b:u(l.end),label:l.name.replace('line','L')})));
+  domView.setBoxes(boxes);drawSeed(r);
   /* each plane: the domain face flattened onto its axis, trimmed to half a part size around the part */
   const lo=u(r.domain_min),hi=u(r.domain_max),pb=[];
   for(const [key,f] of Object.entries(boundaryFaces())){
@@ -5355,43 +6309,92 @@ function chips(el,rows,empty){
   if(rows.length)el.innerHTML=rows.map(([k,v])=>'<div class="stat"><b>'+k+'</b>'+v+'</div>').join('');
   else el.textContent=empty||'';
 }
-const mm=v=>+(v*1000).toPrecision(3)+' mm';
+/* ---------- length units: pure lengths are shown in mm or m (the header's #lenunit), a per-viewer preference.
+   Each such field carries data-len = the unit it is sent and saved in, and its .value property is redefined so
+   every reader and writer (params(), drafts, fillFromCase, the server) still sees that unit; only the number on
+   screen is converted. Probe fields convert every number in their text ---------- */
+let LEN_UNIT='mm';
+const MM_PER={mm:1,m:1000};
+const lenConv=(text,k)=>String(text).replace(/-?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?/gi,n=>String(+(+n*k).toPrecision(12)));
+document.querySelectorAll('input[data-len]').forEach(el=>{
+  const native=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el),'value'),v0=native.get.call(el);
+  const k=()=>MM_PER[el.dataset.len]/MM_PER[LEN_UNIT];   /* saved unit -> shown unit */
+  Object.defineProperty(el,'value',{configurable:true,
+    get(){const v=native.get.call(el);return k()===1?v:lenConv(v,1/k());},
+    set(v){native.set.call(el,k()===1?v:lenConv(v,k()));}});
+  el.value=v0;   /* the HTML value is in the saved unit: show it in the current one */
+});
+/* a length in metres in the shown unit: lenNum -> number, lenTxt -> '12.3 mm' / '0.0123 m' */
+const lenNum=(v,p=3)=>+(v*1000/MM_PER[LEN_UNIT]).toPrecision(p);
+const lenTxt=v=>lenNum(v)+' '+LEN_UNIT;
+function setLenUnit(u){
+  if(!MM_PER[u])u='mm';
+  const els=[...document.querySelectorAll('input[data-len]')],vals=els.map(el=>el.value);   /* saved units, before the switch */
+  LEN_UNIT=u;
+  els.forEach((el,i)=>{
+    el.value=vals[i];
+    const lb=el.parentElement.querySelector('label');if(lb)lb.textContent=lb.textContent.replace(/\((mm|m)\)/,'('+u+')');
+  });
+  $('lenunit').querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.u===u));
+  try{localStorage.setItem('pifoam.lenunit',u);}catch(e){}
+  if(LAST_PREVIEW)showStats(LAST_PREVIEW);   /* readouts and placeholders in the new unit */
+}
+$('lenunit').querySelectorAll('button').forEach(b=>b.onclick=()=>setLenUnit(b.dataset.u));
+try{setLenUnit(localStorage.getItem('pifoam.lenunit'));}catch(e){setLenUnit('mm');}
 function showStats(r){
   if(!r.ok){
     ['livepreview','cellinfo','yplusinfo','physstats','probeinfo','timeinfo'].forEach(id=>chips($(id),[],r.error));
     /* no stale domain: the last good one no longer matches these settings */
-    domView.setBoxes([]);domView.setMarkers([]);physView.setBoxes([]);physView.setMarkers([]);
+    VIEWERS.forEach(v=>{v.setBoxes([]);v.setMarkers([]);});
     $('cellnote').textContent='';renderPhysics(null);renderSteps();return;
   }
   LAST_PREVIEW=r;
   const pm=PRESET_MM[$('mesh_preset').value];   /* a preset: show the sizes it picked */
   if(pm){$('cell_size_mm').value=+(r.cell_size_m*1000).toPrecision(3);$('surface_cell_mm').value=pm;}
+  if(r.atm){$('rho').value=+r.atm.rho.toPrecision(4);$('nu').value=+r.atm.nu.toPrecision(4);}   /* the standard atmosphere's */
   setDomainBoxes(r);
-  const n=r.background_cells,count=n[0]*n[1]*n[2],f=v=>v.toFixed(3),max=+$('max_cells').value||5e6;
+  const n=r.background_cells,count=n[0]*n[1]*n[2],f=v=>lenNum(v,4);
+  /* meshing memory (geometry_summary): the estimated cells plus each MPI process's overhead, against the RAM
+     free right now; there's no cell cap, so a mesh that won't fit only gets this warning */
+  const procs=Math.max(1,+$('nprocs').value||1),need=r.cells_est*r.mem_cell+procs*r.mem_rank,gb=v=>(v/1e9).toFixed(1)+' GB';
   /* cell sizes beside the resolution fields: each refinement level halves the background cell */
-  chips($('cellinfo'),[['Background cell',mm(r.cell_size_m)],
+  chips($('cellinfo'),[['Background cell',lenTxt(r.cell_size_m)],
     ['Background cells',n.join(' &times; ')+' = '+count.toLocaleString()],
-    ['Surface cells',mm(r.surface_cell)+' (level '+r.level+')'],
-    ['Wake cells',r.wake_cell?mm(r.wake_cell)+' (level '+$('wake_level').value+')':null],
-    ['Of max cells',(100*count/max).toPrecision(2)+' % of '+max.toLocaleString()+' (before refinement)']]);
+    ['Surface cells',lenTxt(r.surface_cell)+' (level '+r.level+')'],
+    ['Wake cells',r.wake_cell?lenTxt(r.wake_cell)+' (level '+$('wake_level').value+')':null],
+    ['Estimated cells','about '+big(Math.round(r.cells_est))+' after refinement'],
+    ['Memory to mesh','about '+gb(need)+(r.ram_avail?' of '+gb(r.ram_avail)+' free':'')+' ('+procs+(procs>1?' processes':' process')+')']]);
+  setAlert($('memwarn'),need>r.ram_avail?'bad':need>0.8*r.ram_avail?'warn':'',!r.ram_avail||need<=0.8*r.ram_avail?'':
+    'Meshing needs about '+gb(need)+(need>r.ram_avail?', more than':', close to')+' the '+gb(r.ram_avail)+' of RAM free: '+
+    'snappyHexMesh may be killed. Use a coarser surface or background cell size, fewer layers, a lower wake level or fewer processes, '+
+    'or give WSL more memory below.');
   const want=+$('surface_cell_mm').value;
   $('cellnote').textContent=want&&Math.abs(r.surface_cell*1000-want)>1e-6*want?
-    want+' mm asked: the surface cells are the nearest finer size a whole level reaches.':'';
-  chips($('livepreview'),[['Domain min (m)',r.domain_min.map(f).join(', ')],['Domain max (m)',r.domain_max.map(f).join(', ')],
-    ['Domain size (m)',r.domain_max.map((v,i)=>(v-r.domain_min[i]).toPrecision(3)).join(' &times; ')]]);
-  chips($('yplusinfo'),r.first_layer?[['First layer for y+ '+esc($('yplus').value),mm(r.first_layer)],
-    ['Suggested layers',r.layers_suggest+' (to about half the '+mm(r.surface_cell)+' surface cells)']]:[],
+    lenTxt(want/1000)+' asked: the surface cells are the nearest finer size a whole level reaches.':'';
+  const U=' ('+LEN_UNIT+')';
+  chips($('livepreview'),[['Domain min'+U,r.domain_min.map(f).join(', ')],['Domain max'+U,r.domain_max.map(f).join(', ')],
+    ['Domain size'+U,r.domain_max.map((v,i)=>lenNum(v-r.domain_min[i])).join(' &times; ')]]);
+  chips($('yplusinfo'),r.first_layer?[['First layer for y+ '+esc($('yplus').value),lenTxt(r.first_layer)],
+    ['Suggested layers',r.layers_suggest+' (to about half the '+lenTxt(r.surface_cell)+' surface cells)']]:[],
     'Set a flow speed and viscosity to estimate the first layer height.');
   const t=r.transient,sec=v=>+v.toPrecision(3)+' s';
   if(t)$('end_time_s').placeholder='auto: '+sec(t.end);
   chips($('timeinfo'),t?[['Flow-through time',sec(t.flow_through)],['End time',sec(t.end)+' ('+(+(t.end/t.flow_through).toPrecision(2))+' flow-throughs)'],
     ['Field writes every',sec(t.write)],['First time step',sec(t.dt)],['Time steps','about '+big(Math.round(t.steps))+' at the first step']]:[]);
-  const pr=r.probes,mmv=c=>c.map(v=>+(v*1000).toPrecision(4)).join(', ');
+  const pr=r.probes,mmv=c=>c.map(v=>lenNum(v,4)).join(', ');
   const out=pr?pr.points.concat(pr.lines).filter(q=>!q.inside).map(q=>q.name):[];
-  chips($('probeinfo'),pr?pr.points.map(q=>[q.name+(q.inside?'':' (outside)'),mmv(q.at)+' mm'])
-    .concat(pr.lines.map(l=>[l.name.replace('line','Line ')+(l.inside?'':' (outside)'),mmv(l.start)+' → '+mmv(l.end)+' mm · '+pr.npts+' points'])):[],
+  chips($('probeinfo'),pr?pr.points.map(q=>[q.name+(q.inside?'':' (outside)'),mmv(q.at)+' '+LEN_UNIT])
+    .concat(pr.lines.map(l=>[l.name.replace('line','Line ')+(l.inside?'':' (outside)'),mmv(l.start)+' → '+mmv(l.end)+' '+LEN_UNIT+' · '+pr.npts+' points'])):[],
     'No probes. They also show as markers in the domain preview.');
   setAlert($('probewarn'),'bad',out.length?esc(out.join(', '))+(out.length>1?' lie':' lies')+' outside the flow domain: Create case files will refuse '+(out.length>1?'them':'it')+'.':'');
+  const sc=r.seed||{};   /* the seed rake: its automatic sizes as placeholders, and how much of it misses the domain */
+  if(sc.base){['w','h','gap'].forEach(k=>$('pv_seed_'+k).placeholder='auto: '+lenTxt(sc['auto_'+k]));
+    $('pv_near_mm').placeholder='auto: '+lenTxt(sc.auto_near);$('pv_sec_len').placeholder='auto: '+lenTxt(sc.auto_len);}
+  setAlert($('seedwarn'),sc.error?'bad':'warn',sc.error?esc(sc.error):sc.outside>0?
+    'About '+Math.round(sc.outside*100)+' % of the seed rake lies outside the flow domain: those seeds trace nothing.':'');
+  const ss=r.section||{};   /* the section: errors, and how much of its seed line misses the domain */
+  setAlert($('sectionwarn'),ss.error?'bad':'warn',ss.error?esc(ss.error):ss.outside>0?
+    'About '+Math.round(ss.outside*100)+' % of the section\'s seed line lies outside the flow domain: those seeds trace nothing.':'');
   renderPhysics();
   renderSteps();
 }
@@ -5402,9 +6405,12 @@ const TURB_LABEL={nuTilda:'Inlet &nu;&#771; (m&sup2;/s)',k:'Inlet k (m&sup2;/s&s
   ReThetat:'Inlet Re<sub>&theta;t</sub>',gammaInt:'Inlet &gamma;'};
 function renderPhysics(r=LAST_PREVIEW){
   const p3=v=>+v.toPrecision(3);
+  /* speed of sound: the standard atmosphere's for any gas, else air's at 20 °C */
+  const a=r&&r.atm?r.atm.a:$('fluid').value==='air'?343:0,ma=+$('speed').value/a;
   if(r)chips($('physstats'),[['Reynolds',Number(p3(r.Re)).toLocaleString()],
     ['Dynamic pressure q',p3(r.q)+' Pa'],
-    ['Mach',$('fluid').value==='air'?p3(+$('speed').value/343)+(+$('speed').value/343>0.3?' (too fast: the solver is incompressible)':' (incompressible: fine)'):null],
+    ['Atmosphere',r.atm?(r.atm.T-273.15).toFixed(1)+' °C · '+(+(r.atm.p/100).toPrecision(4))+' hPa':null],
+    ['Mach',a?p3(ma)+(ma>0.3?' (too fast: the solver is incompressible)':' (incompressible: fine)'):null],
     ['Flow direction',r.flow.map(v=>+v.toFixed(3)).join(', ')],
     ['A<sub>ref</sub>',p3(r.Aref)+' m&sup2;'],['l<sub>ref</sub>',p3(r.lRef)+' m'],
     ['Span',p3(r.span)+' m'+(fv('half_model')!=='none'?' (both halves)':'')],
@@ -5414,10 +6420,12 @@ function renderPhysics(r=LAST_PREVIEW){
      simulated Cl, so it comes from the case's history (computed server-side by history()) */
   const mass=massKg(),wing=fv('ref_mode')==='custom',fl=HIST&&HIST.flight;
   chips($('flightstats'),mass>0&&wing&&r?[['Wing loading',p3(mass*9.80665/r.Aref)+' N/m&sup2; · '+p3(mass*1000/(r.Aref*100))+' g/dm&sup2;'],
-    ['Level-flight speed',fl?(fl.v_level?p3(fl.v_level)+' m/s at the simulated Cl':'none (Cl &le; 0)'):null]]:[]);
+    ['Level-flight speed',fl?(fl.v_level?p3(fl.v_level)+' m/s at the Cl simulated at '+p3(fl.speed)+' m/s':'none (Cl &le; 0)'):null]]:[]);
   $('flightnote').textContent=!(mass>0)?'Enter an aircraft mass for the wing loading and flight speed.':
     !wing?'Select Aircraft reference values (wing area) for the wing loading and flight speed.':
-    !fl?'Run the solver for the level-flight speed at the simulated Cl.':'';
+    !fl?'Run the solver for the level-flight speed at the simulated Cl.':
+    fl.v_level&&!fl.matched?'Cl changes with the Reynolds number, so this holds only near '+p3(fl.speed)+' m/s. Solve again at about '+
+      p3(fl.v_level)+' m/s, or run a speed sweep around it under Studies for the speed at the matching Reynolds number.':'';
   /* conflicts that will fail are .bad; the automatic freestream switch is only worth knowing (.info) */
   const bad=[];
   if(+fv('aoa')&&fv('ground')!=='none')bad.push('A ground can\'t be combined with an angle of attack.');
@@ -5427,13 +6435,13 @@ function renderPhysics(r=LAST_PREVIEW){
 }
 function useSuggestedLayers(){
   if(!LAST_PREVIEW||!LAST_PREVIEW.layers_suggest){alert('Load an STL and set the flow first.');return;}
-  $('layers').value=LAST_PREVIEW.layers_suggest;$('layer_mode').value='yplus';
+  $('layers').value=LAST_PREVIEW.layers_suggest;$('layer_mode').value='yplus';updatePreview();
 }
 async function updatePreview(){
   showStats(await j('/api/preview',{method:'POST',body:JSON.stringify(params())}));
 }
-['scale','dir','up_axis','aoa','yaw','ground','ground_gap_mm','pad_side','pad_up','pad_down','cell_size_mm','max_cells',
- 'speed','rho','nu','wake_level','wake_len','yplus','expansion','half_model','aref','lref','cofr_x','cofr_y','cofr_z',
+['scale','dir','up_axis','aoa','yaw','ground','ground_gap_mm','pad_side','pad_up','pad_down','cell_size_mm','layers','n_between',
+ 'speed','rho','nu','altitude','wake_level','wake_len','yplus','expansion','half_model','aref','lref','cofr_x','cofr_y','cofr_z',
  'turb_model','nut_ratio','turb_intensity','omega_mode','turb_length_mm','sim_type',
  'end_time_s','write_count','max_co','delta_t','probe_points','probe_lines','probe_npts']
  .forEach(id=>$(id).addEventListener('change',updatePreview));
@@ -5441,9 +6449,11 @@ async function updatePreview(){
 /* data-when="field=v1 v2": shown only while that select has one of those values (hidden fields keep
    their values). Used for the mesh resolution mode and the domain size mode */
 function syncWhen(){
-  /* "field=v1 v2" shows el while the select has one of those values; several conditions joined by ';' must all hold */
+  /* "field=v1 v2" shows el while the field has one of those values; "f1|f2=…" while either does, a field holding a
+     space-separated list (extra_models) while it lists one; several conditions joined by ';' must all hold */
   document.querySelectorAll('[data-when]').forEach(el=>{
-    el.style.display=el.dataset.when.split(';').every(c=>{const [f,vals]=c.split('=');return vals.split(' ').includes($(f).value);})?'':'none';
+    el.style.display=el.dataset.when.split(';').every(c=>{const [f,vals]=c.split('='),has=f.split('|').flatMap(x=>$(x).value.split(' '));
+      return vals.split(' ').some(v=>has.includes(v));})?'':'none';
   });
 }
 /* resolution: a preset fills the two cell-size fields (showStats, from the preview); editing either field
@@ -5471,7 +6481,7 @@ $('ref_mode').addEventListener('change',()=>{
   }
   syncWhen();updatePreview();
 });
-['turb_model','omega_mode','sim_type','half_model'].forEach(id=>$(id).addEventListener('change',syncWhen));
+['turb_model','omega_mode','sim_type','half_model','dir'].forEach(id=>$(id).addEventListener('change',syncWhen));
 /* a custom cut plane starts at the part's centre on the span axis (file units -> mm), ready to adjust */
 $('half_model').addEventListener('change',()=>{
   if($('half_model').value!=='custom'||$('half_mm').value||!PART_BOX)return;
@@ -5484,9 +6494,49 @@ $('half_mm').addEventListener('change',updatePreview);
 $('target_sm').addEventListener('change',refreshSweep);
 /* mass and target margin only feed derived figures, so they are saved into the open case straight away
    (everything else stays a draft until the case files are created again) */
-['mass','mass_unit','target_sm','pv_near_mm'].forEach(id=>$(id).addEventListener('change',()=>{
+/* the seed rake's fields (seed_rake()): ParaView settings, saved with the case like the pathline count */
+const SEED_IDS=['pv_seed_dx','pv_seed_dy','pv_seed_dz','pv_seed_w','pv_seed_h','pv_seed_gap','pv_near_mm',
+  'pv_sec_pos','pv_sec_len','pv_sec_n','pv_q','pv_oil_n'];
+/* redrawn in the browser on every keystroke or drag step; the server preview (outside-domain share, errors,
+   automatic sizes) runs once the value is committed: Enter, leaving the field, or the end of a drag.
+   The pathline count sets the rake's grid, so it redraws it too */
+SEED_IDS.concat('pv_npath').forEach(id=>{$(id).addEventListener('input',()=>drawSeed());$(id).addEventListener('change',updatePreview);});
+/* a number field changed by dragging sideways inside it: step() per pixel (Shift: a tenth), rounded to the step's
+   decade, never below min; a blank field starts from start(). Fires 'input' while dragging and 'change' on
+   release, as typing does; a click without a drag still places the caret to type */
+function scrub(el,{step,start,min}){
+  el.classList.add('scrub');
+  let lastX=null,acc=0,dragging=false;
+  el.addEventListener('pointerdown',e=>{if(e.button===0){lastX=e.clientX;dragging=false;}});
+  el.addEventListener('pointermove',e=>{
+    if(lastX===null)return;
+    if(!dragging){
+      if(Math.abs(e.clientX-lastX)<4)return;
+      dragging=true;acc=el.value===''?start():+el.value;el.setPointerCapture(e.pointerId);el.blur();
+    }
+    e.preventDefault();
+    const s=step()*(e.shiftKey?0.1:1),q=Math.pow(10,Math.floor(Math.log10(s)));
+    acc+=(e.clientX-lastX)*s;lastX=e.clientX;
+    if(min!=null)acc=Math.max(min(q),acc);
+    el.value=+(Math.round(acc/q)*q).toPrecision(12);
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+  });
+  const end=()=>{if(dragging)el.dispatchEvent(new Event('change',{bubbles:true}));lastX=null;dragging=false;};
+  el.addEventListener('pointerup',end);el.addEventListener('pointercancel',end);
+}
+/* the seed fields scrub in steps of 1/5000 of the part's size (mm); width and height stay at least one step,
+   the distance upstream at least 0 */
+const partMm=()=>PART_BOX?Math.max(...PART_BOX.map(([a,b])=>b-a))*(+$('scale').value||1)*1000:100;
+const seedAuto=k=>{const sc=LAST_PREVIEW&&LAST_PREVIEW.seed;return sc&&sc.base?sc[k]*1000:0;};
+['pv_seed_dx','pv_seed_dy','pv_seed_dz'].forEach(id=>scrub($(id),{step:()=>partMm()/5000,start:()=>0}));
+['w','h','gap'].forEach(k=>scrub($('pv_seed_'+k),{step:()=>partMm()/5000,start:()=>seedAuto('auto_'+k),min:k==='gap'?()=>0:q=>q}));
+scrub($('pv_near_mm'),{step:()=>partMm()/5000,start:()=>seedAuto('auto_near'),min:q=>q});
+scrub($('pv_sec_pos'),{step:()=>partMm()/5000,start:()=>0});
+scrub($('pv_sec_len'),{step:()=>partMm()/5000,start:()=>seedAuto('auto_len'),min:q=>q});
+['mass','mass_unit','target_sm','pv_npath'].concat(SEED_IDS).forEach(id=>$(id).addEventListener('change',()=>{
   if(!CUR)return;
-  const o={mass:$('mass').value,mass_unit:$('mass_unit').value,target_sm:$('target_sm').value,pv_near_mm:$('pv_near_mm').value};
+  const o={mass:$('mass').value,mass_unit:$('mass_unit').value,target_sm:$('target_sm').value,pv_npath:$('pv_npath').value};
+  SEED_IDS.forEach(k=>o[k]=$(k).value);
   j('/api/case_params',{method:'POST',body:JSON.stringify({case:CUR,params:o})});
 }));
 
@@ -5539,7 +6589,22 @@ $('sim_type').innerHTML=Object.entries(SIM_TYPES).map(([k,v])=>'<option value="'
 const simLabel=k=>SIM_TYPES[k]||k||'';
 /* RAS turbulence models (defined server-side in TURB_MODELS) */
 const TURB_MODELS=/*TURB_MODELS*/null;
-$('turb_model').innerHTML=Object.entries(TURB_MODELS).map(([k,v])=>'<option value="'+k+'">'+esc(v)+'</option>').join('');
+/* "Turbulence models": a checkbox per model, at least one ticked. The first ticked (TURB_MODELS order) is the
+   case's own, the hidden #turb_model; the others its extra models, the hidden #extra_models (mirrors
+   extra_models()). Both are sent and drafted like any field; syncModels() redraws the boxes after a bulk fill */
+const tickedModels=()=>[...new Set([$('turb_model').value].concat($('extra_models').value.split(' ')))].filter(k=>TURB_MODELS[k]);
+function syncModels(){
+  const on=tickedModels();
+  $('extra_models').value=Object.keys(TURB_MODELS).filter(k=>k!==$('turb_model').value&&on.includes(k)).join(' ');
+  $('turb_models_ui').innerHTML=Object.entries(TURB_MODELS).map(([k,v])=>
+    '<label class="check"><input type="checkbox" data-model="'+k+'"'+(on.includes(k)?' checked':'')+'> '+esc(v)+'</label>').join('');
+}
+$('turb_models_ui').addEventListener('change',e=>{
+  let on=Array.from($('turb_models_ui').querySelectorAll('input:checked')).map(el=>el.dataset.model);
+  if(!on.length){e.target.checked=true;on=[e.target.dataset.model];}   /* a case needs a model */
+  $('turb_model').value=on[0];$('extra_models').value=on.slice(1).join(' ');
+  $('turb_model').dispatchEvent(new Event('change',{bubbles:true}));   /* what a model change updates: preview, notes */
+});
 
 /* feature panels: each .feature[data-feature] gets its heading (the FEATURE_GROUPS label) and an On / Off
    .seg[data-fseg]; the Studies card carries its seg in the card heading. Switching only updates #features:
@@ -5564,15 +6629,22 @@ function syncFeatures(){
     b.classList.toggle('on',(b.dataset.k==='off')===off.includes(seg.dataset.fseg))));
   document.querySelectorAll('.feature[data-feature]').forEach(el=>el.classList.toggle('off',off.includes(el.dataset.feature)));
   document.querySelectorAll('[data-feat]').forEach(el=>el.classList.toggle('feat-off',off.includes(el.dataset.feat)));
-  syncWhen();VIEWERS.forEach(x=>x.redraw());
+  syncWhen();syncModels();VIEWERS.forEach(x=>x.redraw());
 }
 
 /* fluid material library (defined server-side in MATERIALS) */
 const MATERIALS=/*MATERIALS*/null;
 $('fluid').innerHTML=Object.entries(MATERIALS).map(([k,m])=>'<option value="'+k+'">'+m[0]+'</option>').join('')+'<option value="custom">Custom fluid</option>';
-$('fluid').onchange=()=>{const m=MATERIALS[$('fluid').value];if(m){$('nu').value=m[1];$('rho').value=m[2];updatePreview();}};
-['rho','nu'].forEach(id=>$(id).addEventListener('input',()=>{$('fluid').value='custom';}));
+/* a gas preset can sit in the standard atmosphere (gas_state): its rows show only for gases, and while it applies
+   the server's density and viscosity fill the two fields (showStats). Typing in either makes the fluid Custom */
+const GASES=Object.keys(MATERIALS).filter(k=>MATERIALS[k][3]).join(' ');
+$('atmrow').dataset.when='fluid='+GASES;$('altrow').dataset.when='fluid='+GASES+';atmosphere=isa';
+const atmOn=()=>!!(MATERIALS[$('fluid').value]||[])[3]&&$('atmosphere').value==='isa';
+const fillFluid=()=>{const m=MATERIALS[$('fluid').value];if(m){$('nu').value=m[1];$('rho').value=m[2];}};
+['fluid','atmosphere'].forEach(id=>$(id).addEventListener('change',()=>{fillFluid();syncWhen();updatePreview();}));
+['rho','nu'].forEach(id=>$(id).addEventListener('input',()=>{$('fluid').value='custom';syncWhen();}));
 $('nprocs').value=/*NPROCS*/1;
+$('nprocs').addEventListener('input',()=>{if(LAST_PREVIEW)showStats(LAST_PREVIEW);});   /* meshing memory per process */
 const CORES=/*CORES*/[1,1];   /* [physical cores, hardware threads] */
 $('nprocslabel').textContent='Processes ('+CORES[0]+' physical cores, '+CORES[1]+' threads; 1 = serial)';
 $('file').onchange=e=>uploadFile(e.target.files[0]);
@@ -5582,12 +6654,12 @@ dz.ondragleave=()=>dz.classList.remove('drag');
 dz.ondrop=e=>{e.preventDefault();dz.classList.remove('drag');uploadFile(e.dataTransfer.files[0]);};
 
 /* ---------- setup / run ---------- */
-const PARAMS=['case','sim_type','scale','fluid','speed','dir','up_axis','aoa','yaw','rho','nu','ground','ground_gap_mm',
+const PARAMS=['case','sim_type','scale','fluid','atmosphere','altitude','speed','dir','up_axis','aoa','yaw','rho','nu','ground','ground_gap_mm',
   'domain_mode','pad_side','pad_up','pad_down','dom_x0','dom_x1','dom_y0','dom_y1','dom_z0','dom_z1',
   'mesh_preset','cell_size_mm','surface_cell_mm','endtime',
   'layers','expansion','layer_mode','yplus','wake_level','wake_len','nut_ratio','side_bc','n_between','resolve_angle','feature_angle',
-  'max_cells','final_layer','min_thick','write_interval','relax_U','relax_p','relax_nuTilda','res_p','res_U',
-  'half_model','ref_mode','aref','lref','cofr_x','cofr_y','cofr_z','mass','mass_unit','turb_model','turb_intensity','target_sm','pv_near_mm',
+  'final_layer','min_thick','write_interval','relax_U','relax_p','relax_nuTilda','res_p','res_U',
+  'half_model','ref_mode','aref','lref','cofr_x','cofr_y','cofr_z','mass','mass_unit','turb_model','extra_models','turb_intensity','target_sm','pv_npath',...SEED_IDS,
   'omega_mode','turb_length_mm',
   'end_time_s','write_count','max_co','init_case','delta_t','time_scheme','n_outer','n_corr',
   'probe_points','probe_lines','probe_npts','half_mm','features'];
@@ -5610,14 +6682,18 @@ async function act(a,view){
     }
   }
   const r=await j('/api/run',{method:'POST',body:JSON.stringify({action:a,case:CUR,mesh:meshCfg(),autostop:autostopCfg(),nprocs:+$('nprocs').value,view,
-    near_mm:$('pv_near_mm').value,probe_lines:$('probe_lines').value,probe_npts:$('probe_npts').value})});
+    npath:$('pv_npath').value,seed:Object.fromEntries(SEED_IDS.map(id=>[id,$(id).value])),probe_lines:$('probe_lines').value,probe_npts:$('probe_npts').value})});
   if(!r.ok)alert(r.error);
   else if(a==='sample'&&WRITTEN){WRITTEN.probe_lines=$('probe_lines').value;WRITTEN.probe_npts=$('probe_npts').value;renderSteps();}
 }
 /* ParaView presets (PV_VIEWS server-side): one button each */
 const PV=[['overview','Overview','Domain outline, Cp on the part'],['uslice','Velocity slice','|U| on a plane through the part'],
-  ['pslice','Pressure slice','Cp on the same plane'],['streamlines','Flow pathlines','Streamlines from upstream, coloured by |U|'],
-  ['bodyp','Pressure on body','Cp on the part surface'],['wake','Wake','Surface where |U| is half the flow speed, coloured by Cp']];
+  ['pslice','Pressure slice','Cp on the same plane'],
+  ['rake','Pathlines','An even grid of lines from the seed rake upstream of the part, coloured by |U|'],
+  ['near','Near-part pathlines','The rake\'s lines that pass close to the part only, coloured by |U|'],
+  ['section','Section pathlines','The flow along one span plane, coloured by |U|, with the part cut open'],
+  ['vortex','Vortices','Tip and wake vortex cores (Q criterion), coloured by |U|'],
+  ['oilflow','Oil flow','Skin-friction lines on the part over its wall shear stress (computed first)'],['bodyp','Pressure on body','Cp on the part surface'],['wake','Wake','Surface where |U| is half the flow speed, coloured by Cp']];
 $('pvbtns').innerHTML=PV.map(([v,t,d])=>'<button class="panel interactive" onclick="act(\'paraview\',\''+v+'\')" data-tip="Opens ParaView on this case with this view already set up, at the last saved iteration.">'+icon('external')+t+'<small>'+d+'</small></button>').join('');
 ariaTips();
 
@@ -5648,7 +6724,8 @@ const caseBadges=c=>!c?badge('not created yet'):
    or switching cases before the case files exist (and edits made after). "Create case files" and deleting the
    case clear it. The uploaded STL is not part of a draft. */
 const draftKey=n=>'pifoam.draft.'+n;
-const draftFields=()=>Array.from($('workspace').querySelectorAll('input[id],select[id]')).filter(el=>el.type!=='file');
+const draftFields=()=>Array.from($('workspace').querySelectorAll('input[id],select[id]'))
+  .filter(el=>el.type!=='file'&&!el.closest('[data-nodraft]'));   /* machine-wide settings (WSL memory) aren't a case's */
 function saveDraft(){
   if(!CUR)return;
   const o={};draftFields().forEach(el=>o[el.id]=el.type==='checkbox'?el.checked:el.value);
@@ -5726,10 +6803,10 @@ function renderSteps(){
   const set=(id,t,ic)=>{$('st-'+id).innerHTML=(ic?icon(ic,'sm'):'')+esc(t);};
   const c=CASES.find(x=>x.name===CUR)||{},running=JOBSTATE&&JOBSTATE.case===CUR?JOBSTATE:null;
   set('geomcard',LAST_PREVIEW&&STLNAME?STLNAME:'No STL loaded');
-  const fl=$('fluid'),fluid=fl.value==='custom'?'custom fluid':fl.options[fl.selectedIndex].text;
-  const tm=$('turb_model');
+  const fl=$('fluid'),fluid=(fl.value==='custom'?'custom fluid':fl.options[fl.selectedIndex].text)+(atmOn()?' at '+(+$('altitude').value||0)+' m':'');
+  const tm=tickedModels();
   const tilt=[+fv('aoa')&&'AoA '+fv('aoa')+'°',+fv('yaw')&&'yaw '+fv('yaw')+'°',fv('ground')!=='none'&&'ground',
-    fv('half_model')!=='none'&&'half model',tm.selectedIndex>0&&tm.options[tm.selectedIndex].text].filter(Boolean);
+    fv('half_model')!=='none'&&'half model',(tm.length>1||tm[0]!=='SpalartAllmaras')&&tm.map(k=>TURB_MODELS[k]).join(' + ')].filter(Boolean);
   set('physcard',[$('speed').value+' m/s',fluid].concat(LAST_PREVIEW?['Re '+big(+LAST_PREVIEW.Re.toPrecision(2))]:[],tilt).join(' · '));
   const st=MESH&&MESH.stats||{};
   set('meshcard',running&&/mesh|all/.test(running.kind)&&running.meta.step?'Running '+running.meta.step:
@@ -5757,11 +6834,13 @@ function renderSteps(){
    Everything below compares the form against it. Mass and target margin are saved to the case live, so they
    are not differences. */
 let WRITTEN=null;
-const DIFF_SKIP=['case','sim_type','mass','mass_unit','target_sm','pv_near_mm'];
+const DIFF_SKIP=['case','sim_type','mass','mass_unit','target_sm','pv_npath',...SEED_IDS];
 const writtenVal=k=>{const v=WRITTEN[k];return v!=null?String(v):k==='mesh_preset'?'surface':defaultOf($(k));};
-/* with a preset, the cell-size fields are its output (rounded for display), not settings of their own */
+/* with a preset, the cell-size fields are its output (rounded for display), not settings of their own; so are
+   the density and viscosity in the standard atmosphere */
 const changedKeys=()=>WRITTEN?PARAMS.filter(k=>!DIFF_SKIP.includes(k)&&
-  !(PRESET_MM[$('mesh_preset').value]&&(k==='cell_size_mm'||k==='surface_cell_mm'))&&$(k).value!==writtenVal(k)):[];
+  !(PRESET_MM[$('mesh_preset').value]&&(k==='cell_size_mm'||k==='surface_cell_mm'))&&
+  !(atmOn()&&(k==='rho'||k==='nu'))&&$(k).value!==writtenVal(k)):[];
 /* the 'modified' badge beside the case name, the Run card banner naming the cards with edits, and the revert buttons */
 function renderModified(ch,cards){
   const on=!!CUR&&ch.length>0,show=(el,v)=>{if(el)el.style.display=v?'':'none';};
@@ -6057,11 +7136,14 @@ function renderMeshStatus(ms){
     (ms.last_failed_checks?', '+ms.last_failed_checks+' failed checks':'');
   setAlert($('meshwarn'),ok?'warn':'bad',warn.map(esc).join('<br>'));
   /* checkMesh quality figures; a check checkMesh flagged gets a "failed" badge (text, not just colour), or
-     "tolerated" when the mesh passed anyway (a few surface faces within snappyHexMesh's skewness limit) */
+     "tolerated" when the mesh passed anyway (a few surface faces within snappyHexMesh's skewness limit).
+     More than one region always fails; "repaired" when keep_flow_region removed the disconnected ones */
   const st=ms.stats||{};
   const flag=k=>!st[k].fail?'':ok&&k==='skewness'?' '+badge('tolerated'):' '+badge('failed','bad');
   const q=(k,label,fmt)=>st[k]?[[label,fmt(st[k])+flag(k)]]:[];
-  const rows=[].concat(st.cells?[['Cells',st.cells.toLocaleString()]]:[],st.faces?[['Faces',st.faces.toLocaleString()]]:[],
+  const regions=st.regions==null?[]:[['Regions',st.regions+(st.regions>1?' '+badge('failed','bad'):'')+
+    (ms.repaired?' '+badge('repaired'):'')]];
+  const rows=[].concat(st.cells?[['Cells',st.cells.toLocaleString()]]:[],st.faces?[['Faces',st.faces.toLocaleString()]]:[],regions,
     q('non_orth','Non-orthogonality',v=>v.max.toFixed(1)+'&deg; max, '+v.avg.toFixed(1)+'&deg; avg'),
     q('skewness','Max skewness',v=>v.max.toFixed(2)),q('aspect','Max aspect ratio',v=>v.max.toFixed(1)));
   $('meshstats').className=rows.length?'stats':'';
@@ -6288,7 +7370,8 @@ function renderAverages(av,flight){
   /* with an aircraft mass: wing loading and the speed at which this Cl holds the aircraft up */
   if(av&&flight){
     rows.push(['Wing loading',flight.wing_loading.toPrecision(3)+' N/m&sup2;']);
-    rows.push(['Level-flight speed',flight.v_level?flight.v_level.toPrecision(3)+' m/s':'none (Cl &le; 0)']);
+    rows.push(['Level-flight speed',flight.v_level?flight.v_level.toPrecision(3)+' m/s'+
+      (flight.matched?'':' <span class="note">Cl from '+(+flight.speed.toPrecision(3))+' m/s</span>'):'none (Cl &le; 0)']);
   }
   el.innerHTML=(heads.length?'<div class="readouts">'+heads.join('')+'</div>':'')+
     (rows.length?'<div class="stats">'+rows.map(([k,v])=>'<div class="stat"><b>'+esc(k)+'</b>'+v+'</div>').join('')+'</div>':'');
@@ -6314,11 +7397,21 @@ async function refreshCaseView(){
   if(CMP&&CMP.name!==$('cmp_case').value)CMP=null;
   if($('cmp_case').value&&(!CMP||JOBSTATE&&[c,$('cmp_case').value].includes(JOBSTATE.case)))await loadCompare();
   if(c!==CUR)return;
-  drawChart(h);drawResiduals(h.residuals);renderTable(h);renderAverages(h.averages,h.flight);renderPhysics();drawProbes(h);renderCompare();
+  drawChart(h);drawResiduals(h.residuals);renderTable(h);renderAverages(h.averages,h.flight);renderPhysics();drawProbes(h);renderCompare();renderModels(h.models);
   $('results').textContent=res.text||'';
   /* Results unlock as soon as the solver has written coefficients (also live, mid-solve) */
   $('rescard').classList.toggle('locked',!h.coeffs.rows.length);
   renderSteps();
+}
+/* a case solved with more turbulence models (Physics → Also solve with): one button per model's case in the
+   Results heading, which opens it (its results and ParaView views) */
+function renderModels(models){
+  const seg=$('modelseg'),list=models||[],keys=list.map(m=>m.case).join();
+  seg.style.display=list.length?'':'none';
+  if(seg.dataset.keys!==keys){seg.dataset.keys=keys;
+    segPicker(seg,list.map(m=>[esc(m.case),esc(TURB_MODELS[m.model]||m.model),'Open '+esc(caseLabel(m.case))+', solved with '+esc(TURB_MODELS[m.model]||m.model)+'.']),
+      k=>{if(k!==CUR)pickCase(k);});}
+  seg.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.k===CUR));
 }
 /* ---------- case comparison: another solved case's averages, settings and history beside this one ---------- */
 let CMP=null;   /* {name, hist} of the compared case */
@@ -6370,7 +7463,7 @@ function renderCompare(){
     rows.map(r=>'<tr>'+r.map(v=>'<td>'+esc(v)+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
   /* settings: the written params of both cases as they were used (switched-off features neutral), keys that differ */
   const pa=effParams((LAST_HIST.info||{}).params||{}),pb=effParams((CMP.hist.info||{}).params||{});
-  const diff=PARAMS.filter(k=>k!=='case'&&k!=='features'&&String(pa[k]??'')!==String(pb[k]??''));
+  const diff=PARAMS.filter(k=>k!=='case'&&k!=='features'&&k!=='extra_models'&&String(pa[k]??'')!==String(pb[k]??''));
   show('cmpdiffbox',1);
   $('cmpdiff').innerHTML=diff.length?'<table><thead><tr><th>Setting</th><th>'+esc(caseLabel(CUR))+'</th><th>'+esc(caseLabel(CMP.name))+'</th></tr></thead><tbody>'+
     diff.map(k=>'<tr><td>'+esc(PARAM_LABEL(k))+'</td><td>'+esc(pa[k]??'–')+'</td><td>'+esc(pb[k]??'–')+'</td></tr>').join('')+'</tbody></table>':
@@ -6400,9 +7493,21 @@ function renderSweep(s){
   rows.forEach((r,i)=>{const p=rows[i-1];r['ΔCd %']=p&&p.Cd!=null&&r.Cd!=null&&p.Cd?100*(r.Cd-p.Cd)/Math.abs(p.Cd):null;});
   const keys=['variant','status','cells','Time'].concat([...new Set(rows.flatMap(Object.keys))].filter(k=>!SWEEP_KEY.has(k)&&k!=='case'&&k!=='error'));
   const cell=(k,v)=>v==null?'':typeof v!=='number'?esc(v):k==='cells'?v.toLocaleString():k==='Time'?String(v):k==='ΔCd %'?v.toFixed(2):v.toFixed(4);
-  $('sweeptable').innerHTML='<table><thead><tr>'+keys.map(k=>'<th>'+esc(k)+'</th>').join('')+'</tr></thead><tbody>'+
-    rows.map(r=>'<tr>'+keys.map(k=>'<td'+(r.error&&k==='status'?' data-tip="'+esc(r.error)+'"':'')+'>'+cell(k,r[k])+'</td>').join('')+'</tr>').join('')+'</tbody></table>';
+  /* each variant's case, one click away (its Results card and ParaView views) */
+  const open=r=>!r.case||r.status==='setup_failed'?'':r.case===CUR?'<span class="note">open</span>':
+    '<button class="ghost sm" onclick=\'pickCase('+esc(JSON.stringify(r.case))+')\' data-tip="Open '+esc(caseLabel(r.case))+': its results, charts and ParaView views.">Open</button>';
+  $('sweeptable').innerHTML='<table><thead><tr>'+keys.map(k=>'<th>'+esc(k)+'</th>').join('')+'<th>Case</th></tr></thead><tbody>'+
+    rows.map(r=>'<tr>'+keys.map(k=>'<td'+(r.error&&k==='status'?' data-tip="'+esc(r.error)+'"':'')+'>'+cell(k,r[k])+'</td>').join('')+'<td>'+open(r)+'</td></tr>').join('')+'</tbody></table>';
   if(s.polar||s.yaw){drawSweepChart();return;}
+  /* speed sweep with an aircraft mass: lift against speed, level flight where it crosses the weight */
+  const lv=s.level;
+  if(lv){
+    const xs=lv.points.map(p=>p.V),lo=Math.min(...xs,lv.v),hi=Math.max(...xs,lv.v);
+    chart.style.display='';
+    plot(chart,[{name:'Lift (N)',xs,ys:lv.points.map(p=>p.L)},{name:'Weight (N)',xs:[lo,lv.v,hi],ys:[lv.weight,lv.weight,lv.weight]}],
+      {title:'Lift against flow speed',xlabel:'Flow speed (m/s)',dots:true});
+    return;
+  }
   /* Cd vs cell count for a mesh study, vs the swept value when it's numeric */
   const mesh=['mesh_preset','cell_size_mm','target_cells','surface_cell_mm'].includes(s.param),ok=rows.filter(r=>r.Cd!=null&&(mesh?r.cells:typeof r.variant==='number'));
   chart.style.display=ok.length?'':'none';
@@ -6432,7 +7537,7 @@ function drawSweepChart(){
 function renderAero(s){
   const el=$('aerostats'),note=$('aeronote'),c=[],f=(v,n)=>v==null?null:(+v.toPrecision(n||3)).toString();
   const add=(k,v)=>{if(v!=null)c.push([k,v]);};
-  const p=s&&s.polar,y=s&&s.yaw;let txt='';
+  const p=s&&s.polar,y=s&&s.yaw,l=s&&s.level;let txt='';
   if(p){
     add('CLα',f(p.cl_alpha)&&f(p.cl_alpha)+' /°');add('Zero-lift α',f(p.alpha0)&&f(p.alpha0)+'°');
     add('CLmax',f(p.cl_max)+' at '+f(p.alpha_stall)+'°'+(p.stall_reached?'':' (stall not reached)'));
@@ -6458,6 +7563,11 @@ function renderAero(s){
     const v=(k,good)=>y[k]==null?null:f(y[k])+' /rad '+(good(y[k])?'(stable)':'(unstable)');
     add('Cnβ',v('cn_beta',x=>x>0));add('Clβ',v('cl_beta',x=>x<0));add('CYβ',y.cy_beta!=null?f(y.cy_beta)+' /rad':null);
     txt='Body axes: x forward, y right wing, z down; β positive with the wind from the right. Moments are about the moment reference point.';
+  }else if(l){
+    add('Level-flight speed',f(l.v)+' m/s'+(l.bracketed?'':' (extrapolated)'));
+    add('CL in level flight',f(l.cl));add('Reynolds number',Number(f(l.Re)).toLocaleString());
+    txt='The speed at which the lift carries the weight, with the CL simulated around that speed: CL changes with the Reynolds number, '+
+      'so it is interpolated between the variants on either side.'+(l.bracketed?'':' It lies outside the swept speeds: add a variant beyond it to interpolate.');
   }
   el.className=c.length?'stats':'';
   el.innerHTML=c.map(([k,v])=>'<div class="stat"><b>'+esc(k)+'</b>'+esc(v)+'</div>').join('');
@@ -6504,16 +7614,44 @@ function checkCompletion(s){
 }
 
 /* ---------- server restart ---------- */
-let BOOT=null,QUEUED=0,RESTARTING=false;   /* server process id from /api/state; the poll reloads when it changes */
-async function restartServer(){
-  let msg='Restart the PIFOAM server?';
+let BOOT=null,QUEUED=0,RESTARTING=null;   /* server process id from /api/state; the poll reloads when it changes */
+/* a restart's confirmation, naming the job it stops and the queued jobs it drops */
+function restartWarning(what){
+  let msg=what;
   if(JOBSTATE)msg+='\n\nThis stops '+JOBSTATE.kind+' on '+JOBSTATE.case+' first (a solver writes its current fields).';
   if(QUEUED)msg+='\n'+QUEUED+' queued job(s) will be dropped.';
-  if(!confirm(msg))return;
+  return msg;
+}
+async function restartServer(){
+  if(!confirm(restartWarning('Restart the PIFOAM server?')))return;
   const r=await j('/api/restart',{method:'POST'});
   if(!r.ok)return alert(r.error);
-  RESTARTING=true;$('statustext').textContent='Restarting…';
+  RESTARTING='Restarting…';$('statustext').textContent=RESTARTING;
 }
+
+/* ---------- WSL memory (Mesh card): .wslconfig's memory / swap, which apply once WSL restarts ---------- */
+const gib=v=>(v/2**30).toFixed(1)+' GB';   /* .wslconfig's GB */
+async function loadWslMem(){
+  const r=await j('/api/wslmem');
+  $('wslmem').style.display=r.wsl?'':'none';
+  if(!r.wsl)return;
+  $('wsl_mem').value=r.memory==null?'':+r.memory.toPrecision(3);
+  $('wsl_swap').value=r.swap==null?'':+r.swap.toPrecision(3);
+  /* about 3/4 of Windows' RAM, leaving at least 4 GB to Windows */
+  const sug=r.win_total&&Math.floor(Math.min(0.75*r.win_total,r.win_total-4*2**30)/2**30);
+  chips($('wslinfo'),[['WSL memory now',r.mem_total?gib(r.mem_total)+(r.memory==null?' (default: half)':''):null],
+    ['Swap now',r.swap_total!=null?gib(r.swap_total):null],['Windows RAM',r.win_total?gib(r.win_total):null],
+    ['Suggested memory',sug>=1?sug+' GB':null]]);
+}
+async function applyWslMem(){
+  const mem=$('wsl_mem').value.trim(),swap=$('wsl_swap').value.trim(),gb=v=>v?v+' GB':'WSL\'s default';
+  if(!confirm(restartWarning('Set WSL memory to '+gb(mem)+' and swap to '+gb(swap)+', and restart WSL?\n\n'+
+    'PIFOAM starts again in a new window and this page reconnects; the server in the current window stops.')))return;
+  const r=await j('/api/wslmem',{method:'POST',body:JSON.stringify({memory:mem,swap:swap})});
+  if(!r.ok)return alert(r.error);
+  RESTARTING='Restarting WSL…';$('statustext').textContent=RESTARTING;
+}
+loadWslMem();
 
 /* ---------- polling ---------- */
 setInterval(async()=>{
@@ -6530,7 +7668,7 @@ setInterval(async()=>{
   BOOT=s.boot;QUEUED=(s.queue||[]).length;
   JOBSTATE=s.running&&s.job?Object.assign({now:s.now},s.job):null;
   const pr=JOBSTATE&&progress(JOBSTATE.meta),step=JOBSTATE&&JOBSTATE.meta.step;
-  $('statustext').textContent=RESTARTING?'Restarting…':!s.running?'Idle':pr?('Solving '+pr.sofar+(pr.left!=null?' · '+dur(pr.left)+' left':'')+' · '+s.job.case):
+  $('statustext').textContent=RESTARTING?RESTARTING:!s.running?'Idle':pr?('Solving '+pr.sofar+(pr.left!=null?' · '+dur(pr.left)+' left':'')+' · '+s.job.case):
     ('Running '+(s.job?s.job.kind+' · '+s.job.case+(step?' · '+step:''):''));
   $('status').classList.toggle('run',!!s.running);
   /* solver progress bar, for the case on screen */
@@ -6636,6 +7774,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send({"error": str(e)})
         if u.path == "/api/cases":
             return self.send({"ok": True, "cases": list_cases(), "folders": list_folders()})
+        if u.path == "/api/wslmem":
+            return self.send({"ok": True, **wsl_memory()})
         if u.path == "/api/thumb":   # ?case= a case's part, or ?folder= a folder's shared part
             try:
                 if "folder" in q:
@@ -6659,6 +7799,8 @@ class Handler(BaseHTTPRequestHandler):
                 out["polar"] = polar_summary(rows, ref, mass, target_sm)
             elif LAST_SWEEP.get("param") == "yaw":
                 out["yaw"] = yaw_summary(rows, ref)
+            elif LAST_SWEEP.get("param") == "speed":
+                out["level"] = level_summary(rows, ref, mass)
             return self.send(out)
         self.send({"error": "not found"}, code=404)
 
@@ -6693,7 +7835,7 @@ class Handler(BaseHTTPRequestHandler):
                 req = json.loads(self.body())
                 return self.send({"ok": True, "name": rename_case(req.get("case"), req.get("new"))})
             if u.path == "/api/setup":
-                return self.send({"ok": True, **setup_case(json.loads(self.body()))})
+                return self.send({"ok": True, **setup_with_models(json.loads(self.body()))})
             if u.path == "/api/preview":
                 return self.send({"ok": True, **preview_geometry(json.loads(self.body()))})
             if u.path == "/api/case_template":
@@ -6718,6 +7860,12 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/restart":
                 self.send({"ok": True})   # answered before the re-exec can cut the connection
                 threading.Thread(target=restart_server, daemon=True).start()
+                return
+            if u.path == "/api/wslmem":   # write .wslconfig, then restart WSL (and this server) so it applies
+                req = json.loads(self.body())
+                set_wsl_memory(req.get("memory"), req.get("swap"))
+                self.send({"ok": True})
+                threading.Thread(target=restart_wsl, daemon=True).start()
                 return
             if u.path == "/api/queue/clear":
                 with QUEUE_LOCK:
@@ -6748,17 +7896,28 @@ class Handler(BaseHTTPRequestHandler):
                     view = req.get("view") or "overview"
                     if view not in PV_VIEWS:
                         return self.send({"ok": False, "error": f"Unknown ParaView view '{view}'."})
-                    near = str(req.get("near_mm") or "").strip()
+                    npath = str(req.get("npath") or "").strip()
                     try:
-                        near = float(near) if near else None
+                        npath = int(npath) if npath else None
                     except ValueError:
-                        near = -1
-                    if near is not None and not near > 0:
-                        return self.send({"ok": False, "error": "Pathline distance must be a number of mm above 0, or blank."})
-                    open(os.path.join(case, "pifoam_open.py"), "w").write(paraview_script(case, view, near))
+                        npath = -1
+                    if npath is not None and not 10 <= npath <= 5000:
+                        return self.send({"ok": False, "error": "Number of pathlines must be a whole number from 10 to 5000, or blank."})
+                    seed = req.get("seed") or {}   # sent with the click: the case_params save may not have landed yet
+                    prep = ""
+                    if view in PV_FIELDS:
+                        # a field the solver doesn't write: computed into the last time once (a re-solve deletes
+                        # the time dirs) by OpenFOAM - fast, unlike ParaView - never under a running job
+                        rel = case_rel(req.get("case"))
+                        if case_busy(rel):
+                            return self.send({"ok": False, "error": busy_error(rel)})
+                        f = PV_FIELDS[view]
+                        prep = (f't=$(foamListTimes -latestTime | tail -1); [ -n "$t" ] && [ ! -f "$t/{f}" ] '
+                                f"&& foamPostProcess -solver incompressibleFluid -func {f} -latestTime; ")
+                    open(os.path.join(case, "pifoam_open.py"), "w").write(paraview_script(case, view, npath, seed))
                     # Ubuntu's ParaView package installs paraview.simple into dist-packages but its
                     # embedded Python doesn't search there ("No module named 'paraview'")
-                    subprocess.Popen(foam_bash("touch case.foam; "
+                    subprocess.Popen(foam_bash("touch case.foam; " + prep +
                                                "export PYTHONPATH=/usr/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}; "
                                                "paraview --script=pifoam_open.py"),
                                      cwd=case, start_new_session=True,
@@ -6782,6 +7941,9 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send({"ok": False, "error": "That feature is switched off for this case. Switch "
                                                                 "Studies (Studies heading) or Angle of attack / "
                                                                 "yaw (Physics) On to use it."})
+                    if param == "altitude" and not fluid_gas(base_params):
+                        return self.send({"ok": False, "error": "An altitude sweep needs a gas: pick air or another "
+                                                                "gas under Physics → Fluid."})
                     case_name = case_rel(base_params.get("case"))
                     ahead = run_job("sweep", case_name, do_sweep, base_params, param, values, mesh_kwargs,
                                     autostop_cfg, nprocs, STATE["verts"], max(1, int(req.get("avg") or AVG_WINDOW)))
@@ -6807,7 +7969,7 @@ class Handler(BaseHTTPRequestHandler):
                 if a == "mesh":
                     ahead = run_job("mesh", case_name, do_mesh, case, nprocs=nprocs, **mesh_kwargs)
                 elif a == "solve":
-                    ahead = run_job("solve", case_name, do_solve, case, autostop=autostop_cfg, nprocs=nprocs)
+                    ahead = run_job("solve", case_name, do_solve_models, case, autostop=autostop_cfg, nprocs=nprocs)
                 elif a == "all":
                     ahead = run_job("all", case_name, do_all, case, mesh_cfg=mesh_kwargs,
                                     autostop_cfg=autostop_cfg, nprocs=nprocs)
